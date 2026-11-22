@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.30.4.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.30.5.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -964,6 +964,11 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.30.5: the testbed's Python is the newest minor on which the most of ComfyUI's and the packs' requirement files
+  install from wheels, not only the newest torch ships for (2026-11-22, issue #71). Torch had cp315 wheels while
+  onnxruntime and kornia-rs had none, so on 3.15 Easy-Use's, RMBG's and controlnet_aux's nodes never registered. A
+  CUDA-only pack fails on every minor alike and never decides. Exercised by the suite's fake-uv sandbox and on the
+  self-hosted CI runner through a package gate run against this branch.
 - 3.30.4: the testbed installs ComfyUI's own requirements from wheels first, and shows uv's error when torch or
   those requirements fail (2026-11-22, issue #71). On CPython 3.15 kornia-rs has no wheel and its source build needs
   cmake, which sank ComfyUI's whole install on the CI runner, so every package gate died on `No module named

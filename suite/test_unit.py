@@ -1348,6 +1348,9 @@ EOF
     exit 0;;
   "pip compile") cat >/dev/null; v=""; prev=""
     for a in "$@"; do [ "$prev" = "--python-version" ] && v="$a"; prev="$a"; done
+    for a in "$@"; do case "$a" in */requirements.txt)                  # $REQ_BAD: "<minor>:<folder>" pairs that need a build
+      pkg="$(basename "$(dirname "$a")")"
+      for bad in ${REQ_BAD:-}; do [ "$bad" = "$v:$pkg" ] && { echo "no wheels for $pkg on $v" >&2; exit 1; }; done; exit 0;; esac; done
     for ok in $TORCH_OK; do [ "$ok" = "$v" ] && exit 0; done
     echo "No solution found when resolving dependencies: torch" >&2; exit 1;;
   "venv --python") d="$4"
@@ -1385,6 +1388,26 @@ def test_unit_testbed_picks_the_newest_python_torch_ships_for(tmp_path):
     tb, log, run = _testbed_sandbox(tmp_path / "later", "3.15 3.14")
     r = run("_testbed_python_pick")
     assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "3.15", r.stdout + r.stderr
+
+
+def test_unit_testbed_pick_prefers_the_minor_where_more_requirement_files_install_from_wheels(tmp_path):
+    """3.30.5 (issue #71): torch had cp315 wheels but onnxruntime and kornia-rs had none, so on 3.15 ComfyUI's own install
+    and Easy-Use failed and their nodes never registered. With ComfyUI and packs on disk the pick counts the requirement
+    files each torch-ready minor installs from wheels alone (--no-build): the most wins, the newer on a tie."""
+    _repo_only("the repo's testbed.sh")
+    tb, log, run = _testbed_sandbox(tmp_path, "3.15 3.14 3.13")
+    for d in ("testbed", "testbed/custom_nodes/Easy-Use", "testbed/custom_nodes/KJNodes"):
+        (tb / d).mkdir(parents=True, exist_ok=True); (tb / d / "requirements.txt").write_text("x\n")
+    packs = 'PACKS=("Easy-Use|u||" "KJNodes|u||"); '
+    r = run(packs + "REQ_BAD='3.15:testbed 3.15:Easy-Use' _testbed_python_pick")
+    assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "3.14", r.stdout + r.stderr
+    assert "Python 3.15: 1 of 3 requirement files install from wheels" in r.stderr, r.stderr
+    assert "Python 3.14: 3 of 3" in r.stderr, r.stderr
+    assert all("--no-build" in ln for ln in log.read_text().splitlines() if "requirements.txt" in ln)
+    r = run(packs + "REQ_BAD='' _testbed_python_pick")                     # a tie: the newest
+    assert r.stdout.strip().splitlines()[-1] == "3.15", r.stdout + r.stderr
+    r = run(packs + "REQ_BAD='3.15:KJNodes 3.14:KJNodes 3.13:KJNodes' _testbed_python_pick")   # fails everywhere: never decides
+    assert r.stdout.strip().splitlines()[-1] == "3.15", r.stdout + r.stderr
 
 
 def test_unit_testbed_pick_keeps_a_working_venv_when_nothing_resolves(tmp_path):
