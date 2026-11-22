@@ -158,5 +158,20 @@ def test_unit_the_testbed_takes_cpu_torch_on_linux_and_leaves_the_pod_alone():
         pytest.skip("no testbed.sh (not a repo checkout)")
     src = tb.read_text()
     i = src.index('if [ "$(uname -s)" = Linux ]; then export UV_TORCH_BACKEND=cpu; fi')
-    assert i < src.index("torch torchvision torchaudio >/dev/null"), "the backend must be set before the torch install"
+    assert i < src.index('--python "$VENV/bin/python" torch torchvision torchaudio'), "the backend must be set before the torch install"
     assert "UV_TORCH_BACKEND=cpu" not in (BASE / "lib" / "30-venv.sh").read_text(), "the pod's venv picks its own backend"
+
+
+def test_unit_the_testbed_installs_comfyuis_requirements_from_wheels_first_and_shows_uvs_error():
+    """3.30.4 (issue #71): on CPython 3.15 kornia-rs has no wheel and its source build needs cmake, which sank ComfyUI's
+    whole install on the CI runner, behind a /dev/null. Wheels first (--no-build), the plain install only as the
+    fallback, and both through _uv_shown, which prints uv's output when it fails."""
+    tb = BASE / "testbed.sh"
+    if not tb.exists():
+        pytest.skip("no testbed.sh (not a repo checkout)")
+    src = tb.read_text()
+    rows = [l for l in src.splitlines() if '-r "$COMFY/requirements.txt" pytest' in l and "_uv_shown" in l]
+    assert len(rows) == 2, rows
+    assert "--no-build" in rows[0] and "--no-build" not in rows[1], "wheels first, the plain install second"
+    assert '-r "$COMFY/requirements.txt" pytest >/dev/null 2>&1' not in src, "ComfyUI's install never hides uv's error"
+    assert '_uv_shown "torch" uv pip install' in src, "the torch install shows uv's error too"
