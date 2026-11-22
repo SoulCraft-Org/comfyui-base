@@ -282,17 +282,34 @@ _venv_minor(){ "$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_in
 # Newest first, each minor asked whether the torch family resolves on it (a cached resolve, no install), the first
 # yes wins: still "always the newest", only the newest that works. The pod does the same in lib/30-venv.sh
 # (_base_python_pick, against the whole derived set, since 3.6.1). Stable minors only: the pattern skips 3.16.0a1 and +freethreaded.
+# 3.30.5: torch is not the only thing that lags. Once ComfyUI and the packs are on disk, every minor torch resolves on
+# is also asked how many of their requirement files install from wheels alone (--no-build), and the minor with the
+# most wins, the newer one on a tie. On 2026-11-22 torch had cp315 wheels but onnxruntime had none (Easy-Use, RMBG,
+# controlnet_aux need it) and kornia-rs none either, so 3.15 lost those packs' nodes and 3.14 installs them (issue #71).
+# CUDA-only packs fail on every minor alike, so they never decide. With no requirement files the first torch yes wins.
 _testbed_python_pick(){ # → x.y on stdout; why on stderr
-  local cands mm tmp="${TMPDIR:-/tmp}/testbed-pick.$$.txt" have
+  local cands mm tmp="${TMPDIR:-/tmp}/testbed-pick.$$.txt" have row dir f n best="" bestn=-1 reqs=() back=()
   cands="$(uv python list 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV || true)"
   [ -n "$cands" ] || { warn "uv lists no CPython: cannot pick a Python" >&2; return 1; }
+  [ -f "$COMFY/requirements.txt" ] && reqs+=("$COMFY/requirements.txt")
+  for row in ${PACKS[@]+"${PACKS[@]}"}; do
+    dir="${row%%|*}"; [ -f "$CN/$dir/requirements.txt" ] && reqs+=("$CN/$dir/requirements.txt")
+  done
+  [ "$(uname -s)" = Linux ] && back=(--torch-backend cpu)                # what the install below draws from
   for mm in $cands; do
-    if printf 'torch\ntorchvision\ntorchaudio\n' | uv pip compile --quiet --python-version "$mm" - -o "$tmp" >/dev/null 2>&1; then
-      rm -f "$tmp"; echo "$mm"; return 0
+    if ! printf 'torch\ntorchvision\ntorchaudio\n' | uv pip compile --quiet --python-version "$mm" - -o "$tmp" >/dev/null 2>&1; then
+      note "Python $mm: torch has no build for it yet, trying the next" >&2; continue
     fi
-    note "Python $mm: torch has no build for it yet, trying the next" >&2
+    [ "${#reqs[@]}" -gt 0 ] || { rm -f "$tmp"; echo "$mm"; return 0; }
+    n=0
+    for f in "${reqs[@]}"; do
+      uv pip compile --quiet --no-build ${back[@]+"${back[@]}"} --python-version "$mm" "$f" -o "$tmp" >/dev/null 2>&1 && n=$((n + 1))
+    done
+    note "Python $mm: $n of ${#reqs[@]} requirement files install from wheels" >&2
+    if [ "$n" -gt "$bestn" ]; then best="$mm"; bestn="$n"; fi
   done
   rm -f "$tmp"
+  [ -z "$best" ] || { echo "$best"; return 0; }
   # nothing resolves (offline, or the index is down): keep a venv that runs rather than tear it down for a guess
   have="$(_venv_minor)"
   local keep="trying the newest"; [ -z "$have" ] || keep="keeping the venv's Python $have"
