@@ -354,7 +354,12 @@ provision_server() {
     else
       # best effort on a Mac: several packs are CUDA-only and will not resolve here; install what does, pack by pack
       warn "the full set does not resolve on this host (expected for CUDA-only packs): installing it pack by pack"
-      _uv_shown "ComfyUI's own requirements" uv pip install -q --upgrade --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest || true
+      # 3.30.4: wheels first. On a Python newer than a dependency's wheels uv builds that dependency from source, and one
+      # failed build sinks the whole set: kornia-rs (kornia >= 0.8) has no cp315 wheel and needs cmake, so on CPython 3.15
+      # ComfyUI's install died and the server could not import comfy_aimdo (issue #71). --no-build takes the newest version
+      # that has a wheel (kornia 0.7.1 there); a set that cannot resolve that way installs as before.
+      _uv_shown "ComfyUI's own requirements (wheels only)" uv pip install -q --upgrade --no-build --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest \
+        || _uv_shown "ComfyUI's own requirements" uv pip install -q --upgrade --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest || true
       local f
       for f in "${files[@]}"; do
         uv run --no-project --quiet --with packaging python "$REQLIFT" --out "$derived.one" --map /dev/null "$f" >/dev/null 2>&1 || continue
