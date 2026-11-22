@@ -315,6 +315,19 @@ _testbed_venv(){ # <x.y>
   fi
 }
 
+# 3.30.4: an install the server cannot start without (torch, ComfyUI's own requirements) prints uv's own error when it
+# fails. Both used to go to /dev/null, so on CI a failed resolve surfaced only as the server's later
+# "No module named 'comfy_aimdo'", with the cause gone (every package gate since 2026-11-02).
+_uv_shown(){ # <what> <uv command…> → uv's status; on failure the last 25 lines of its output
+  local what="$1" log="${TMPDIR:-/tmp}/testbed-uv.$$.log" rc=0; shift
+  "$@" >"$log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "$what: uv exited $rc. Its output:"
+    tail -n 25 "$log" | sed 's/^/      /'
+  fi
+  rm -f "$log"; return "$rc"
+}
+
 provision_server() {
   hdr "VENV + SERVER (CPU)"
   command -v uv >/dev/null || { warn "uv is not installed — needed to build the venv"; return 1; }
@@ -328,7 +341,7 @@ provision_server() {
   # and the pod's install (lib/30-venv.sh) chooses its own backend: neither changes.
   if [ "$(uname -s)" = Linux ]; then export UV_TORCH_BACKEND=cpu; fi
   note "installing torch (CPU${UV_TORCH_BACKEND:+, uv --torch-backend $UV_TORCH_BACKEND}) + every requirement at its newest: this is the slow part …"
-  uv pip install -q --upgrade --python "$VENV/bin/python" torch torchvision torchaudio >/dev/null
+  _uv_shown "torch" uv pip install -q --upgrade --python "$VENV/bin/python" torch torchvision torchaudio
   # one pin-free set: ComfyUI's own == pins (its frontend packages) and every pack's are lifted by the base's reqlift
   local row dir files=("ComfyUI=$COMFY/requirements.txt") derived="$COMFY/.testbed-derived.txt"   # inside the ignored testbed tree
   for row in "${PACKS[@]}"; do
@@ -341,7 +354,7 @@ provision_server() {
     else
       # best effort on a Mac: several packs are CUDA-only and will not resolve here; install what does, pack by pack
       warn "the full set does not resolve on this host (expected for CUDA-only packs): installing it pack by pack"
-      uv pip install -q --upgrade --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest >/dev/null 2>&1 || true
+      _uv_shown "ComfyUI's own requirements" uv pip install -q --upgrade --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest || true
       local f
       for f in "${files[@]}"; do
         uv run --no-project --quiet --with packaging python "$REQLIFT" --out "$derived.one" --map /dev/null "$f" >/dev/null 2>&1 || continue
