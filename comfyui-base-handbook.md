@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.30.6.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.30.7.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -964,6 +964,20 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.30.7: triton beside the testbed's CPU torch on Linux (2026-10-17, found by an image package's CI; first written
+  as 3.22.1 on its own branch and carried onto 3.30.6 on 2026-11-23). The CPU torch
+  that 3.18.2 gave the testbed has no triton, which a pod's CUDA torch carries (`lib/30-venv.sh` keeps it in the torch
+  family), and packs import it at module level: ComfyUI-RMBG's HEAD (229529e) bundles a sam3 whose `edt.py` does
+  `import triton`, the pack's loader then raises a NameError in its own except branch and none of its nodes register,
+  and ComfyUI-Easy-Sam3 stops on `No module named 'triton'`. Every package that uses RMBG saw a missing node on CI.
+  `testbed.sh --server` on Linux now installs the newest triton right after torch, against a constraints file of the
+  torch family as installed (`testbed/.testbed-torch.txt`), so it never moves torch; importing it needs no GPU. A miss is
+  a warning and the build goes on. `--status` names the venv's triton on Linux, and, for every package, the packs its own
+  server could not import: each pack ComfyUI's "Import times for custom nodes" marks `(IMPORT FAILED)` in that server's
+  log, or "none". An image package's CI (run 39078526395) had passed its suite while RMBG never registered, with nothing in the
+  log to say so. macOS (no triton wheels) and the pod's install are unchanged. Unit tests hold the order, the
+  constraints, the warning, the macOS path, and the import report (a failed pack named, a clean one not, "none", a
+  foreign server never read). Exercised on the CI runner only.
 - 3.30.6: the handbook names no package that is not sold (2026-11-23, Paul: SoulCraft sells only Bria FIBO 2.0 and
   Lightricks LTX products). Version-history notes say "an image package" or "a video package" instead; no code changed.
 - 3.30.5: the testbed's Python is the newest minor on which the most of ComfyUI's and the packs' requirement files
