@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.22.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.30.6.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -92,7 +92,8 @@ run once per machine as **step one**; then each workflow package is **step two**
    ComfyUI it did not start before starting its own (3.0.3).
 8. **One deletion prompt, default No.** Duplicates, superseded files (only inside the package's own family
    folders) and partials, never a file another installed package claims (the ledger). `BASE_YES=1` approves.
-9. **Privacy and secrets.** Outbound hosts are huggingface.co, github.com, pypi.org, pypi.nvidia.com,
+9. **Privacy and secrets.** Outbound hosts are huggingface.co, github.com, civitai.com (3.25.0; with the storage its
+   download URLs redirect to, which never receives the token), pypi.org, pypi.nvidia.com,
    download.pytorch.org, the distribution's apt mirrors and developer.download.nvidia.com (NVIDIA's CUDA repository); a `MODELS` row may name no other host. Nothing is uploaded. `--disable-api-nodes` is
    launch-arg hygiene. Tokens come from the shell env, else the machine's own environment (PID 1's: `HF_TOKEN` or its
    aliases `HUGGING_FACE_HUB_TOKEN` / `HF_HUB_TOKEN`), else `state/tokens.env` (0600), else one prompt. Template
@@ -150,10 +151,11 @@ run once per machine as **step one**; then each workflow package is **step two**
     its newest, which §0.3 forbids. The base ships neither the generator nor the extension.
     **A proven runtime is not a freeze** (3.1.0): `runtime-capture` packs a green machine's code (the tree minus its
     data, the uv Python, the venv, the git-checkout packs, JupyterLab, the wheel cache; never a package's vendored
-    packs, which its zip brings) into parts under 2 GiB with `runtime.json`,
+    packs, which its zip brings) into independent zstd parts (3.29.3: each its own tar, any order, all at once) with `runtime.json`,
     the only place its versions are written; `runtime-apply <manifest>` unpacks it on a buyer's machine, and
     `BASE_RUNTIME=<state/runtime.json>` installs from it with no OS, git, pip or uv step, each skip noted, the driver
-    gate held at the manifest's floor. A package that needs a pack the runtime lacks fails by name ("needs a newer
+    gate held at the manifest's floor (3.29.2: the floor of the runtime's own torch CUDA build, 580 for cu130, never the
+    capture machine's driver). A package that needs a pack the runtime lacks fails by name ("needs a newer
     runtime"). It is the §0.3 exception, and nothing else runs this way.
 13. **The model library may be SHARED by several machines** (2.4.0). `BASE_LIBRARY` names a store that more than
     one machine mounts at once, and with it set `models/` and ComfyUI's `output/` and `input/` live there instead of
@@ -230,19 +232,26 @@ holds the interface and a recipe.
 ### 1.1 RunPod (proven)
 
 **The one command (2.0.14).** Once a pod is reachable (`podctl ensure`), the whole documented sequence is
-`uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<package dir>"…`. For each item in order,
-the local zip is checked current, the volume size is recorded for the disk gate, the zip is uploaded and extracted,
+`uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<package dir>"…`. Every local zip is checked
+current first, the volume size is recorded for the disk gate, and every zip goes up in one upload (3.24.0: a zip already
+on the machine with the same size and sha256 is not sent again). Then for each item in order the zip is extracted,
 `--check` runs on the pod (non-zero stops everything), the real run goes detached (`BASE_RESTART=1` for a package;
 `--comfy-ref <ref>` for a newer ComfyUI, that install only) and is polled until `STEP RC=`, the pod's `state/logs` are
 copied to `<item>/_build/podruns/<date>/pod-logs/`, the summary block is printed, and a green run writes the pack records
 it printed (each pack's HEAD) into the local script and rebuilds its zip. A run that upgraded the NVIDIA driver stops with
 "restart required" and prints the `podctl restart` a person approves; the same install then continues. A red run stops with the console's path: the log is the deliverable, the fix loop
 starts there. `podctl tunnel <pod>` is the one ssh session that forwards ports (8188, 8888, each app port the machine
-serves (3.9.0), and 9199 and 11434 beside them:
-the base runs no metrics exporter and no inference server, but a package may run one on the machine and reach
-it on loopback, which is the shape a package takes when its point is that nothing leaves the box) for the canvas tools and
-the browser; it prints them first as named localhost links (`ComfyUI http://localhost:8188`, `Jupyter Terminal
-http://localhost:8888/lab?token=…`, one per app), which is how a `--private` pod's ports are named. `podctl prune <pod>` lists the old-layout folders an earlier layout left under `/workspace/packages`
+serves (3.9.0); the ssh-config block also carries 9199: the base runs no metrics exporter, but a package may run one
+on the machine and read it on loopback) for the canvas tools and the browser; it prints them first as named localhost
+links (`ComfyUI http://localhost:8188`, `Jupyter Terminal http://localhost:8888/lab?token=…`, one per app), which is
+how a `--private` pod's ports are named. Those are the local numbers with nothing set. `PODCTL_TUNNEL_OFFSET=N` adds N
+to each, and `PODCTL_TUNNEL_BASE=<port>` (3.23.0) moves every local side into a block of the workstation's own:
+machine N takes `base+10N` to `base+10N+9`, ComfyUI, JupyterLab and 9199 at the first three, the app ports after them
+by port. Pick a base that leaves room for every machine: each machine takes 10 ports (base+10N … base+10N+9), so the
+whole fleet must fit inside your account's block, e.g. base 3150 for up to 5 machines in 3100–3199. A base like 3180
+with a third machine would run into the next account's block. The remote ports never move (`hosts/README.md` has the
+details). 11434 is no longer forwarded (3.23.0);
+`--port 11434` forwards it for a package that runs an inference server on the machine. `podctl prune <pod>` lists the old-layout folders an earlier layout left under `/workspace/packages`
 (`<Display Name>/` with a `<Display Name> Script.sh`, and `ComfyUI Base/`) and their workflow copies in ComfyUI's
 browser; `--yes` removes exactly those, after the re-install has put the `<name>/` folders beside them. `--pkg` takes
 the repository-relative package path (`<brand>/packages/<name>`) or a bare `<name>` that one brand has.
@@ -279,7 +288,7 @@ way runpodctl v3 does). That template carries the names and nothing else: no env
 app at its own port's root (§6). **Open by default (3.19.1).** Since 3.19.1 the links are OPEN by default: one click on the Connect tab opens ComfyUI, each app and the Jupyter Terminal (no key, no token), because RunPod's proxy passes nothing that names the pod's owner (its docs: the service "becomes publicly accessible"; "implement proper authentication in your application"), so any login is a step. The key below, and JupyterLab's token on the public bind, are the opt-in: `BASE_LINK_LOCK=1` in the pod's env (`podctl create --lock`). **The key (3.14.0), now opt-in.** Every one of those links but the terminal's is locked by the pod's
 own `BASE_LINK_TOKEN` (fresh per pod from `create`, else generated by the boot): the printed link carries it once
 (`/?token=<key>`), the forwarder trades it for a host-only cookie and redirects to the clean URL, and the Connect tab's
-plain links open from then on; neither gives a plain 401. ComfyUI itself binds 127.0.0.1 on a public bind and the
+plain links open from then on; neither gives a plain 401. **The key the customer already has (3.30.0).** A template that sets `BASE_LINK_TOKEN_FROM=<NAME>` makes the key the value of its own variable `NAME` (the base takes the name, never a brand's variable): nothing is generated, saved or printed, the 401 page becomes a one-field form (POST `/__base_unlock`), and the customer types the key once; the Logs tab is not needed. The App ports row of the contract table has the rules. ComfyUI itself binds 127.0.0.1 on a public bind and the
 forwarder serves 8188 on the container's other addresses (`--front`), so nothing from outside reaches it unlocked. A
 public pod is the default again (`--private` is opt-in), and it reuses the network volume `comfy-base-data` where the
 GPU is free, so models download once (`hosts/runpod/README.md`). Fallback
@@ -291,6 +300,9 @@ prints the sshd snippet to paste.
 `sm_103`, 288 GB). A package says so with `GPU_PREFER="B200 B300"` (§4), and `py/gpu_fit.py` is the one table and rule
 behind it: the pod's own run warns in its banner and SUMMARY, and `podctl install` warns before it uploads, when the
 GPU is below (another architecture with less memory: an H200 at 141 GB, an RTX PRO 6000 at 96 GB). Never a stop.
+3.28.0: the table also names `GB300` (10.3 = `sm_103`, 288 GB, on a Grace aarch64 host) and `RTX-PRO-6000` (the RTX PRO
+6000 Blackwell Server Edition, 12.0 = `sm_120`, 96 GB), so a package can prefer either; and a GPU of a preferred
+architecture fits only with 90 % of that class's memory too, since `sm_120` is an RTX 5090's (32 GB) as well.
 `podctl create` takes the same order when no `--gpu` is given, and a CUDA floor of 13.0. What holds on RunPod, read 2026-10-15/16 (stock moves; the
 create reads it live):
 
@@ -298,8 +310,10 @@ create reads it live):
   one datacenter with B300 that also takes a network volume. `NVIDIA B300 SXM6 AC MIG 1g.34gb` is a 34 GB slice, not
   a B300, and `gpu_fit.py` never counts it as one.
 - A network volume pins its datacenter: create it where the GPU is, and a pod on it can only ever be that DC's GPU.
-- The CUDA floor is 13.0 (REST `allowedCudaVersions: ["13.0"]`; GraphQL calls it `minCudaVersion`): the base's cu130
-  torch and the Blackwell kernels need a 580+ driver, and a host on CUDA 12.x answers with an older one.
+- The CUDA floor is 13.0: the base's cu130 torch and the Blackwell kernels need a 580+ driver, and a host on CUDA 12.x
+  answers with an older one. 3.29.0: it is never sent as REST v1 `allowedCudaVersions` (an exact match, and every B200,
+  B300 and RTX PRO 6000 host with stock reported 13.2 on 2026-10-26, which v1's enum cannot name). Stock is read from
+  REST v2's catalog with `minCudaVersion`, and the placed pod's `cudaVersion` is held to the floor (`check_pod_cuda`).
 - No NVENC. NVIDIA's encode/decode matrix gives the HGX B200 and B300 0 NVENC engines (7 NVDEC), like the H100, so an
   `h264_nvenc` save fails there; encode on the CPU (`libx264`). "RTX" features (RTX Video Super Resolution) name an
   RTX GPU, which these are not.
@@ -443,7 +457,12 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   PKG_COMMANDS PKG_IMPORT_CHECK PKG_NO_SUITE ZIP_EXTRA VENDORED_PACKS GPU_PREFER`. `GPU_PREFER="B200 B300"` (3.8.0) names
   the GPU classes the package is tuned for, best first, from `py/gpu_fit.py`'s table (an unknown class is an invalid
   declaration); a GPU below them is a warning in the run's banner and SUMMARY and in `podctl install`, never a stop
-  (§1.1). `PKG_NO_SUITE=1` is how a package that ships no `suite.py`
+  (§1.1). `HYGIENE_ARGS+=( "--cache-ram 10 32" )` (3.28.0) puts `--cache-ram 10 32` in the args file: the headroom in GB
+  of ComfyUI's RAM-pressure cache, the active then the inactive cache's (`comfy/cli_args.py`, at most two values). It is
+  the one row that keeps two values (any other keeps one); with no such row the base writes nothing. It is never written
+  beside `--cache-classic`, `--cache-lru` or `--cache-none` (one argparse group), nor for a ComfyUI without the flag;
+  `HYGIENE_ARGS_REMOVE` takes it out with both values, and a row of anything but one or two numbers refuses the
+  declaration. `PKG_NO_SUITE=1` is how a package that ships no `suite.py`
   says so: the run's test stage notes it, and `verify.sh` passes the package as "no suite, declared". `LOADER_CATS`
   rows (`NodeType|library category`) extend the base's map of loader node types to library folders (`lib/60-sync.sh`
   covers ComfyUI's core loaders and the shared packs'); a package whose own pack loads models declares its loaders here.
@@ -473,12 +492,15 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   install's restart and every boot alike, reads the whole folder (`lib/85-launch.sh`, `_base_launch_env`). Allowed keys:
   `OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS
   TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING RENDER_SPEED_ATTENTION` (3.18.0: the
-  attention order a node pack reads at startup, `off`, `cudnn` or `fa4`) and CTranslate2's `CT2_*`;
+  attention order a node pack reads at startup, `off`, `cudnn` or `fa4`), `RENDER_SPEED_LANCZOS_THREADS` (3.28.0: the same
+  pack's thread count for every lanczos resize in the process, the same bytes) and CTranslate2's `CT2_*`;
   a value is one word of `[A-Za-z0-9_.,:+-]`. Anything else (a path, a library, a token, a variable the base owns such
   as `HF_HOME`) refuses the package's declarations before anything downloads, and a key set twice does too.
   Precedence: the machine's own environment (a variable set on the pod, in the unit) wins; then the packages' files in
   name order, the first naming a key winning and a different later value named in the launch's output; then the
-  base's one default, `OMP_NUM_THREADS` from the container's CPU quota. `BASE_DECLARE_ONLY=1` prints
+  base's defaults, `OMP_NUM_THREADS` from the container's CPU quota and (3.28.0) `CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0`
+  while the venv's `nvidia-cudnn-cu*` wheel is cuDNN 9.22.0 up to 9.25.1 (NVIDIA's workaround for the default kernel
+  cache's data corruption, fixed in 9.25.1; a package cannot set it). `BASE_DECLARE_ONLY=1` prints
   `LAUNCHENV KEY=value`. A base before 3.10.0 ignores the array, so a package that depends on it sets `BASE_MIN`.
 - The CPU quota (3.10.0): when nothing sets `OMP_NUM_THREADS`, the base sets it to the CPUs the container's cgroup
   quota allows (`cpu.max`, v2, or `cpu.cfs_quota_us` / `cpu.cfs_period_us`, v1; rounded up; never more than the CPUs
@@ -492,7 +514,9 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   quota's count. Inter-op threads, the GPU and CUDA kernels are unaffected. On a machine with no quota torch keeps its
   own default (the physical cores it sees), the right number there.
 - Hooks, called if defined, dry-run aware via `$BASE_DRY`: `pkg_pre_venv pkg_post_venv pkg_pre_models
-  pkg_post_models pkg_hygiene pkg_import_check pkg_post_install pkg_summary`, and `pkg_cmd_<name>` per
+  pkg_post_models pkg_hygiene pkg_import_check pkg_post_install pkg_summary`. 3.27.0: register model folders
+  (`_base_yaml_register`) from `pkg_hygiene`, not `pkg_post_models`: hygiene runs before a first install's early start, and
+  ComfyUI reads `extra_model_paths.yaml` only at start, so a folder registered later costs a second start. And `pkg_cmd_<name>` per
   `PKG_COMMANDS` row `name|function|help`. A failing hook fails the run. A package whose `pkg_post_venv` compiles
   something (SageAttention) is listed for re-run after any venv rebuild.
 - `PACKS` rows: `dir|url|sha|cnr_id|why[|branch]`: `sha` is 40 hex, the last-tested record (every run takes the pack to
@@ -506,7 +530,9 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   name with spaces (the tail of a `why` that held a `|`) or a seventh field is refused when the tables are validated.
   Leave it off unless the remote's HEAD is genuinely stale.
 - `MODELS` rows: `category|Family|Purpose|file|url|bytes|note|alts` — `bytes` exact (`base.sh gen-models <dir>`
-  fills it from the Hub); `url` is a Hugging Face `resolve` URL, a GitHub URL (a release asset), `LOCAL`, or
+  fills it from the Hub); `url` is a Hugging Face `resolve` URL, a GitHub URL (a release asset), a Civitai download
+  URL (3.25.0: `https://civitai.com/api/download/models/<versionId>`, its query only Civitai's file selectors `fileId`,
+  `type`, `format`, `size`, `fp`, never a token), `LOCAL`, or
   `hf://owner/repo` with `file` ending in `/` for a repo snapshot; no other host is accepted; `alts` are legacy
   basenames the index may adopt. Pin a row to a commit (3.12.0): `resolve/<40-hex commit>/<path>` for a file,
   `hf://owner/repo@<40-hex commit>` for a snapshot (a branch after the `@` is refused). The revision a row names is
@@ -593,9 +619,12 @@ background (3.11.0, below)] → the venv snapshot → `pkg_pre_venv` → venv �
 `pkg_post_venv` → own packs (VENDORED_PACKS mirrored from the zip, 3.2.0) → packs pip (the derived, pin-free set) → Comfy
 MCP → newest (every package still behind forced to its newest; 3.3.0: each force is carried as a floor, `state/lift/forced.txt`,
 so the next run's first resolve keeps it; a force a package refused is remembered in `refused.tsv` and tried again only when
-either version moves) → `pkg_pre_models` → [join the model downloads] →
-models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub, curl for
-GitHub; disk gate first) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
+either version moves) → `pkg_pre_models` → [3.27.0, a first install (`BASE_RESTART=1`, no server answering): the import
+check, hygiene, then ComfyUI started NOW, beside the downloads; base_restart waits for it below] → [join the model downloads] →
+models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub;
+3.25.0: Civitai, and a GitHub file of `BASE_RANGE_MIN_MB` (256) or more, over `BASE_RANGE_CONNS` (16) connections, hashed as
+they land (`py/fetch_ranges.py`); curl for a smaller GitHub file; disk gate first; one line per file in
+`state/logs/<run>.downloads.tsv`) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
 import check (3.15.0: from the local copy; with `BASE_RESTART=1` and no server answering, deferred to the restart, whose
 own start is judged from its slice of `comfyui.log` by the same rules) → hygiene → boot (boot.sh, tools venv, boot.env) →
 ledger → restart hand-off (or `BASE_RESTART=1`) →
@@ -660,7 +689,104 @@ nothing changed, and it stops only on what would stop the real run before that r
 suite, which would only test the server the real run is about to replace. `podctl install --base --pkg <dir>` installs
 the base and runs ONE pipeline, the package's (it already covers every stage the base's own run would); the base's suite
 runs on a machine once per base version (`state/base-suite.ok`). A retry of the same zip against the same base skips the
-Mac gate, and podctl polls every 5 s.
+Mac gate. podctl polls every 5 s, and since 3.24.0 the wait is on the machine (STEP RC is looked for once a second there),
+so the end of a step is seen within a second. Every ssh, scp and log fetch of one run shares ONE connection (3.24.0,
+ControlMaster; `PODCTL_SSH_MUX=0` turns it off).
+
+**The image's head start** (3.26.0). On the template image (`runpod-template`, `ghcr.io/soulcraft-org/comfyui-base`),
+`BASE_IMAGE_SEED` (`/opt/comfy-seed`) holds a seed built at the volume's own paths, and from runpod-template#21 on, uv's
+cache with every wheel of the seed's venv (one copy in the layer: the cache's files are hardlinks of the venv's). A podctl
+pod never copies the seed (its boot guard runs only a `boot.sh` already on the volume), so its venv used to fetch the
+4.1 GB the image already held. A venv the run must build now reads the seed's cache, the twin of the volume's
+`.cache/uv`, for the rest of the run: the wheels it holds are linked into the venv (copied across filesystems,
+`UV_LINK_MODE=copy`) instead of downloaded and unpacked, and only what moved since the image was built is fetched.
+Every pick and the newest pass run as before, and the versions are a cold cache's: the cache's index listings from the
+build day are deleted before uv reads it, so only immutable per-file entries (metadata, unpacked wheels) are reused. A
+reused venv keeps the volume's own cache. The image's CPython is copied
+onto a volume that has none of that minor before `uv python upgrade`, which still moves it to a newer patch. The seed is
+not a second install: CONSOLIDATE neither reports nor sizes its tree and venv, and moves a pack of ours out of it into
+`custom_nodes`, where the pack pass fetches it instead of cloning it.
+
+**The runtime's parts and how they land** (3.29.3): `runtime-capture` cuts the runtime into independent parts, each its own
+zstd-compressed tar (`runtime.NNN.tar.zst`, 256 MiB of file content each by default, `--part-bytes`: 268 MB at most even if nothing compresses, under the 315 MB a single-request upload to Cloudflare's R2 takes), carrying the directories above
+its own files so it unpacks alone; compression runs one part per CPU. `runtime.json` lists each part's `name`, `sha256`,
+`bytes` (packed) and `raw` (unpacked), with `format: 3`, `compression: zstd` (format 2, without split files, is still read).
+**A file larger than a part is split** (3.30.3): it is cut into chunks of `--part-bytes`, each chunk its own tar member in a part of
+its own (`kind: chunks`, holding only chunks), so no part passes `--part-bytes` plus headers, one big CUDA library is fetched as
+several parts at once, and the long pole of the parallel fetch is gone. `runtime.json`'s `files` lists each split file's
+`path`, `mode`, `mtime`, `bytes`, whole-file `sha256` and its `chunks` (`part`, `member`, `offset`, `bytes`). `runtime-apply` checks
+that the chunks tile the file exactly and name listed parts, creates the file at its full size before any part is unpacked, has
+each chunk's worker write its bytes at its offset (`pwrite`, no copy to join them) in whatever order the parts land, and when a
+file's last chunk is in checks the whole file's sha256 against the manifest (the judge), then sets its mode and mtime. A chunk
+missing from its part, or a file whose bytes do not add up, fails the apply naming the file; a corrupt part fails by its own
+sha256, by part name. `runtime-capture` fails when a packed part passes `--max-packed` (315 MB by default, 0 for none). `runtime-apply <manifest> [--parts <links.json>]
+[--jobs N]` fetches N parts at once (8; `BASE_RUNTIME_JOBS`), largest first, from the manifest's https URL (parts beside it,
+or each part's own `url`), from the per-part links given beside a local manifest (`--parts links.json`: the site's entitlement `runtime` object as it
+comes, `{id, manifest: {url, sha256, bytes}, parts: [{name, url, sha256, bytes}]}`, or a bare list of parts; the manifest's
+own sha256 and bytes judge every part, the links' values are only a cross-check and a disagreement is refused, as is a
+manifest that is not the one the links name; a link is a credential, never printed, lasts about ten minutes and a
+failed one fails its part by name, retried only a few times), or
+from a local folder; each part's size and sha256 are checked and the part is unpacked (`zstd -dc | tar -x`) the moment it
+lands, in parallel with the rest, then deleted. Nothing is stamped until every part is in; a failed part stops the apply,
+named, and a re-run fetches again. `zstd` must be on the machine (the apply installs the package where it is root and apt
+exists). The apply's wall seconds, bytes and GB/s are the RUNTIME row of the timing ledger
+(`state/logs/runtime-apply_<ts>.timings.tsv` and `.timeline.tsv`) and `state/runtime-apply.json`.
+
+**RunPod's stock image in runtime mode** (3.30.2): `runpod/comfyui:1.4.7-cuda13.0`, a local volume disk at `/workspace`, the
+boot kit as the entrypoint. Read from the code and held by suite tests; not yet run on a pod.
+
+- **No OS step is needed, and none runs.** Runtime mode skips the OS stage. The image ships `nvcc` and `cudart` only (no
+  cuBLAS, no headers): `base_cuda_toolchain` is called only by a source build (SageAttention, llama-cpp-python), and
+  runtime mode starts none: SageAttention takes the runtime's own build by its cache key or nothing, and the background
+  cuBLAS probe is off. What the OS stage would have installed, the runtime carries as `runtime.json`'s `apt`: `runtime-capture`
+  writes the base's own list (`_base_apt_core`: `python3-venv ffmpeg libegl1 libgles2`, one list the OS stage reads too, plus
+  `openssh-server` and `nfs-common` where the capture machine has them) with `zstd` first, each only if dpkg reports it on
+  the capture machine. `runtime-apply` installs only the ones `dpkg -s` reports missing, in the background beside the unpack:
+  `zstd` and `python3-venv` first (the unpack waits for zstd where the image lacks it, the install's downloader waits for
+  python3-venv), the rest after, the package lists refreshed only when the image keeps none or the install fails. It joins
+  before the stamp is written, so ComfyUI never starts before a library a pack loads at import is there. The seconds and
+  the packages are in the RUNTIME row (`apt Ns: ...`) and `state/runtime-apply.json`; a package that could not be installed
+  (no root, no network) is a warning in the apply and in the next install's summary, not a stop. `runtime-capture` is
+  independent of how the pod was made (a podctl round on the stock image, or the template): it reads only the machine.
+- **`BASE_LOCAL_RUN` stays off.** `auto` is on only where the host is RunPod and the tree's filesystem is a network one
+  (`py/run_local.py --auto` reads the mount type); a local volume disk is "not a network filesystem: it runs in place", so
+  nothing is copied to `/opt/comfy-run`. A network volume still gets the copy.
+- **The tree and the venv are the volume's.** `/workspace/ComfyUI`, its `.venv-cu130`, `/workspace/comfy-base/python` (the uv
+  Pythons), `comfy-base/tools`, `ComfyUI/models`. Runtime mode pins `COMFY_DIR` to the manifest's tree before discovery, so
+  another tree on the volume (RunPod's own `runpod-slim/ComfyUI`, one a recorded `state/boot.env` names) is never the one
+  read or checked.
+- **The image's own ComfyUI and start script are never used.** The image's tree (`/opt/comfyui-baked`) lives on the container
+  disk, which discovery never counts as a tree, and no lib or py file names it; the image's start script is not the
+  entrypoint (the boot kit is, and `podctl ensure` rewrites a pod's start command to it). The one thing of the image's the
+  base can touch is a model-shaped file by name: the model index walks `/` and may move a file the image ships onto the
+  volume instead of downloading it.
+- **What a capture on that image holds.** ComfyUI's tree without `models`, `input`, `output`, `user` and `temp`, with every
+  pack that is a git checkout (`.git` included: the tree must equal the manifest's commits); the uv Pythons
+  (`comfy-base/python`) and uv (`comfy-base/bin`); the venv `ComfyUI/.venv-cu130` (torch cu130 with its `nvidia-*` wheels, the
+  packs' requirements, the SageAttention build); the tools venv (JupyterLab); `comfy-base/state/wheels` (the SageAttention
+  wheel); and `runtime.json` (commits, `cuda`, `driver_min`, `apt`, the parts). Never models, outputs, tokens or a package's
+  vendored packs.
+- **Its size, estimated** (nothing here was measured on a capture): earlier reads put the torch-and-NVIDIA closure at
+  6.7 to 7.2 GB as a venv (3.18.2), a Video Swapper venv with its packs' requirements at 12 GB (3.15.0), and 4.1 GB of wheels
+  in 165 packages (3.26.0); the tree without models is a few hundred MB plus the packs' `.git` (about 1 to 2 GB), the uv
+  Pythons about 0.2 GB, the tools venv about 0.4 GB. So about 13 to 16 GB unpacked, in about 55 to 64 parts of 256 MiB, and,
+  at zstd level 3 on CUDA libraries (about 0.5 to 0.6), about 7 to 9 GB packed, 130 to 160 MB a part (the CUDA libraries larger
+  than 256 MiB, the biggest over 1 GB unpacked, are split into chunks of 256 MiB, so no part passes about 270 MB). At the 2 GB/s the
+  downloads reach that is about 4 s of line, so the volume's write speed sets the unpack. The first live capture's
+  `runtime.json` and RUNTIME row replace this paragraph's numbers.
+
+**The models do not wait for the unpack** (3.30.1): `runtime-apply` holds `state/runtime.applying` (`<pid> <manifest sha256>`;
+a dead pid is no lock) while it runs and puts the manifest at `state/runtime.json` as soon as it has it, so a boot kit can
+start the apply in the background and the package's install (`BASE_RUNTIME=state/runtime.json`) beside it. An install whose
+manifest is not stamped yet but is being applied is "pending": it validates the package's tables, checks the driver floor,
+asks for its tokens, then starts the first set of model downloads at once (§5, the early pass) into `<tree>/models`, where
+the tree will be, and waits (`BASE_RUNTIME_WAIT`, 3600 s) for the stamp only where it first needs the tree, the venv or a
+pack: `RUNTIME · waiting for the unpack`. Pod to App ready is the longer of the unpack and the first models, plus the
+checks and one ComfyUI start. The downloader is `hf` in a venv of the system Python under `comfy-base/fetch` (no uv step
+and no runtime Python: both may be unpacking), and a row inside a pack (`custom_nodes/`), `BASE_LIBRARY` and a shared
+store keep the old order (they wait for the tree). An apply that ends without a stamp (or a dead lock) fails the install
+by name. The unpack's seconds, bytes and GB/s join the install's ledger as `RUNTIME (in the background, beside the
+models)` and its timeline span; a runtime applied earlier starts the models at t0 just the same, with no wait.
 
 **A buyer's machine** (`BASE_RUNTIME`, 3.1.0): the same pipeline with the system step, the ComfyUI update, the pack
 moves, the venv build, packs pip, Comfy MCP and the newest pass each replaced by a note; the tree and every pack are
@@ -681,7 +807,7 @@ and a failed import check is a failure, never a rollback.
 | Tokens | the machine's own environment (a `{{`-prefixed value is an unresolved RunPod Secret reference: a placeholder), then `state/tokens.env` (§0.9); `HF_TOKEN` and `CIVITAI_TOKEN` with their aliases. A RunPod pod `podctl create` made references the account's Secrets of those names when they exist (3.19.0) |
 | The host | `BASE_HOST`, `BASE_VOLUME`, `BASE_VOLUME_KIND`, `BASE_LISTEN` (§1); `state/host.env` when the driver wrote it |
 | The boot | `boot.sh`: PID 1 via podctl's start command on RunPod, the process of `comfy-base-boot.service` on a VM host: sshd (keys only) → JupyterLab (base tools venv, `JUPYTER_TOKEN`/`JUPYTER_PASSWORD`, else generated: never tokenless) → boot extensions (§9) → ComfyUI (base venv, base line, bound to `BASE_LISTEN`) → the app ports (3.9.0) → sleep forever |
-| App ports | `py/app_proxy.py` (standard library, any python3, never the GPU): one process for every row of `state/apps.d/*.list`, bound to `BASE_LISTEN`; on a public bind also ComfyUI's front (`--front 8188` on the machine's non-loopback addresses, ComfyUI on 127.0.0.1), and every link it serves needs the key (`BASE_LINK_TOKEN`: `?token=` once, then a host-only HttpOnly Secure SameSite=Lax cookie; else 401; loopback peers pass; constant-time; never logged; the cookie stripped before ComfyUI). `:<port>/<path>` → `127.0.0.1:8188/apps/<slug>/<path>`, except `ws upload view history queue interrupt`, which pass unchanged; one request per connection (`Connection: close` both ways), then bytes piped both ways, so bodies, streams and the websocket's 101 pass unparsed; `Host` and `Origin` untouched; a page that says ComfyUI is starting while it does not answer. `boot.sh --apps` restarts it (the install runs it) |
+| App ports | `py/app_proxy.py` (standard library, any python3, never the GPU): one process for every row of `state/apps.d/*.list`, bound to `BASE_LISTEN`; on a public bind also ComfyUI's front (`--front 8188` on the machine's non-loopback addresses, ComfyUI on 127.0.0.1), and every link it serves needs the key (`BASE_LINK_TOKEN`: `?token=` once, then a host-only HttpOnly Secure SameSite=Lax cookie; else 401; loopback peers pass; constant-time; never logged; the cookie stripped before ComfyUI). `:<port>/<path>` → `127.0.0.1:8188/apps/<slug>/<path>`, except `ws upload view history queue interrupt`, which pass unchanged; one request per connection (`Connection: close` both ways), then bytes piped both ways, so bodies, streams and the websocket's 101 pass unparsed; `Host` and `Origin` untouched; a page that says ComfyUI is starting while it does not answer. `boot.sh --apps` restarts it (the install runs it); **3.30.0: with `BASE_LINK_TOKEN_FROM=<NAME>` the key is the value of the environment variable `NAME` (the pod's own; `boot.sh` re-exports it from PID 1 when its shell did not inherit it) instead of `BASE_LINK_TOKEN`: the 401 page carries one password field and one button that POST the key to the reserved path `/__base_unlock` on the same host (no app route may use that path); a constant-time match answers with the same host-only HttpOnly Secure SameSite=Lax cookie, whose value is an HMAC of the key (the customer's own key never sits in the browser), and a 303 to the page asked for (`next`: a local path only); a miss shows the form with one sentence; per-address backoff (five free misses, then 2 s doubling to 5 min; the TCP peer, never `X-Forwarded-For`; a refused try is not compared); `?token=` still works; the key is never logged, forwarded, put in argv or written to disk (no `tokens.env` line); `boot.sh` prints no token line for it and says once on the console that the links ask for the key; `NAME` empty or unset falls back to the usual key; it locks only with `BASE_LINK_LOCK=1`, like any key** |
 | Servers | 3.20.0: one ComfyUI per GPU (`nvidia-smi --query-gpu=index`, or the machine's own `CUDA_VISIBLE_DEVICES`; `BASE_SERVERS` caps it, `1` is the single server of every earlier base; no GPU is one server). Server 0 is `$PORT` (8188) exactly as before (the front, the app ports and the links reach it alone); server i is `127.0.0.1:18188+i`, never a host port (8189 and up are app ports). All share the tree, venv, packs, models, launch env, args file and the input, output and user folders; each has `CUDA_VISIBLE_DEVICES` its own GPU, its own `--temp-directory <server 0's>/gpu<i>` (ComfyUI empties its temp at start) and `--database-url sqlite:///…/gpu<i>/comfyui.db` (when the ComfyUI has the flag), `logs/comfyui-gpu<i>.log`, `comfyui-gpu<i>.pid`. Every process gets `COMFY_BASE_SERVERS=127.0.0.1:8188,127.0.0.1:18189,…` (server 0 first) and `COMFY_BASE_SERVER_INDEX`: a package's runner sends parts to each by `POST /prompt` and `GET /history`. The default `OMP_NUM_THREADS` is the quota divided by N. Started together, at boot and at every restart; server 0's answer is the verdict, another that fails is named |
 | Restart | `_base_pids_from_table`: a python running `main.py` from the tree, or naming a `…/ComfyUI/main.py`; never PID 1. It stops every server; the start brings one up per GPU (3.20.0) |
 | Uploads | `<volume>/packages/` (`podctl upload`); each package extracted into its own folder there |
@@ -803,9 +929,10 @@ There are two transports and the difference is not cosmetic:
 
 The lifecycle and discovery tools need the tree, and the tree is on the machine — which is why the server is
 installed there and ssh is the default. The ssh transport passes `ClearAllForwardings=yes`: the `Host` block
-`podctl ssh-config` writes carries four `LocalForward` lines, and a second session binding them while a tunnel
+`podctl ssh-config` writes carries three `LocalForward` lines, and a second session binding them while a tunnel
 holds them prints warnings onto the very stdio channel MCP is speaking. The tunnel transport takes the alias's
-own local port (`tunnel_locals`), so two machines never point at one tunnel.
+own local port (`tunnel_locals`: the offset, or the slot under `PODCTL_TUNNEL_BASE`), so two machines never point at
+one tunnel.
 
 **What this repository does NOT ship.** No `.mcp.json` is committed, and no settings file approves one
 (`enabledMcpjsonServers`, `enableAllProjectMcpServers`). This is a public toolchain many people clone: Claude Code
@@ -837,7 +964,8 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
-- 3.22.1: triton beside the testbed's CPU torch on Linux (2026-10-17, found by image-creator-krea-2#10). The CPU torch
+- 3.30.7: triton beside the testbed's CPU torch on Linux (2026-10-17, found by an image package's CI; first written
+  as 3.22.1 on its own branch and carried onto 3.30.6 on 2026-11-23). The CPU torch
   that 3.18.2 gave the testbed has no triton, which a pod's CUDA torch carries (`lib/30-venv.sh` keeps it in the torch
   family), and packs import it at module level: ComfyUI-RMBG's HEAD (229529e) bundles a sam3 whose `edt.py` does
   `import triton`, the pack's loader then raises a NameError in its own except branch and none of its nodes register,
@@ -846,10 +974,294 @@ for any invocation that somehow arrives without the environment. The suite asser
   torch family as installed (`testbed/.testbed-torch.txt`), so it never moves torch; importing it needs no GPU. A miss is
   a warning and the build goes on. `--status` names the venv's triton on Linux, and, for every package, the packs its own
   server could not import: each pack ComfyUI's "Import times for custom nodes" marks `(IMPORT FAILED)` in that server's
-  log, or "none". Krea 2's CI (run 39078526395) had passed its suite while RMBG never registered, with nothing in the
+  log, or "none". An image package's CI (run 39078526395) had passed its suite while RMBG never registered, with nothing in the
   log to say so. macOS (no triton wheels) and the pod's install are unchanged. Unit tests hold the order, the
   constraints, the warning, the macOS path, and the import report (a failed pack named, a clean one not, "none", a
   foreign server never read). Exercised on the CI runner only.
+- 3.30.6: the handbook names no package that is not sold (2026-11-23, Paul: SoulCraft sells only Bria FIBO 2.0 and
+  Lightricks LTX products). Version-history notes say "an image package" or "a video package" instead; no code changed.
+- 3.30.5: the testbed's Python is the newest minor on which the most of ComfyUI's and the packs' requirement files
+  install from wheels, not only the newest torch ships for (2026-11-22, issue #71). Torch had cp315 wheels while
+  onnxruntime and kornia-rs had none, so on 3.15 Easy-Use's, RMBG's and controlnet_aux's nodes never registered. A
+  CUDA-only pack fails on every minor alike and never decides. Exercised by the suite's fake-uv sandbox and on the
+  self-hosted CI runner through a package gate run against this branch.
+- 3.30.4: the testbed installs ComfyUI's own requirements from wheels first, and shows uv's error when torch or
+  those requirements fail (2026-11-22, issue #71). On CPython 3.15 kornia-rs has no wheel and its source build needs
+  cmake, which sank ComfyUI's whole install on the CI runner, so every package gate died on `No module named
+  'comfy_aimdo'`. Exercised on the self-hosted CI runner through a package gate run against this branch.
+- 3.30.3: a file larger than a part is split across parts (2026-10-26). Exercised by the suite and by hand runs of `runtime.py
+  build` and `apply` on a small tree on macOS (a 250 KB random file in 100 KB parts: three chunks in three parts, applied in
+  order, in reverse and through the worker pool, with a missing chunk, a wrong whole-file hash and a corrupt part each refused
+  by name); not on a live machine. The default part is 256 MiB (3.30.2) and a library of 1 GB or more was one part alone,
+  over the 315 MB a single `wrangler r2 object put` takes and the long pole of the parallel fetch. Now `runtime-capture` cuts
+  any regular file over `--part-bytes` into chunks of that size, each its own tar member in parts of their own, one file's
+  chunks in different parts; `runtime.json` is `format: 3` with `files` (path, mode, mtime, bytes, sha256, chunks) and
+  `kind: chunks` on those parts, and `runtime-apply` reads formats 2 and 3 (format 3 is what is captured now). Apply
+  creates each split file at its full size, writes each chunk at its offset with `pwrite` as its part lands (no join copy,
+  any order), and checks the whole file's sha256 when its last chunk is in, then sets its mode and mtime; the RUNTIME
+  ledger row counts the split files and the seconds they took. The "NOTE n part(s) pass 315 MB" line of 3.30.2 is a hard
+  error now (`--max-packed`, default 315 MB, 0 for none), which only an explicit larger `--part-bytes` can trip.
+- 3.30.2: runtime mode on RunPod's stock image (2026-10-26). Exercised by the suite and by hand runs of capture, apply, the
+  tree pin and the zstd gate against stand-in `apt-get` and `dpkg-query` on macOS; not on a pod. (1) `runtime.json` carries
+  `apt`, written by `runtime-capture` from the base's own list (`_base_apt_core`, now the one list the OS stage reads too)
+  plus `zstd`, each only if dpkg reports it. (2) `runtime-apply` installs only the missing ones with apt, in the background
+  beside the unpack: `zstd` and `python3-venv` first, the rest after; the unpack waits for zstd (`--zstd-wait`, ended at once
+  by a failed install's gate file), the install's downloader waits for python3-venv, the stamp waits for all of it; the
+  seconds are in the RUNTIME row. This is the `zstd` answer for an image without it: (a) apt, since the stock image's Python
+  is 3.12 and only 3.14 has `compression.zstd`. Packages it could not install are a warning, said again in the next
+  install's summary. (3) Runtime mode pins `COMFY_DIR` to the manifest's tree. (4) §1.1 states what was checked on the stock
+  image: no OS step, no cuBLAS need, `BASE_LOCAL_RUN` off on a local disk, volume paths, the image's tree and start script
+  unused, what a capture holds, and an estimate of its size. `runtime.py` gains `apt`, `result-add` and `ledger-line`.
+  (5) The default part is 256 MiB of content (was 512 MB), so a part stays under the 315 MB one request to R2 takes even if
+  nothing compresses; a file larger than that is a part alone and `runtime.py build` names any part over 315 MB packed.
+- 3.30.1: runtime mode starts the staged model downloads at t0 (2026-10-26). Exercised by the suite and by a hand run of
+  the stub package's install beside a slowed `runtime-apply` (5 parts at 1.5 s each, one connection) on macOS; not on a
+  live machine. Before, a buyer's install fetched models only at the model stage, after the tree, venv and pack checks
+  (no early pass: it needs uv). Now `runtime-apply` holds `state/runtime.applying` and writes `state/runtime.json` early;
+  an install that finds its manifest being applied is pending: tables, driver floor, tokens, then the early model
+  downloads (`_base_runtime_pretree` names where the tree will be; the downloader is `hf` in a pip venv of the system
+  Python, `_base_fetch_tool_pip`), then `RUNTIME · waiting for the unpack` (`BASE_RUNTIME_WAIT`) and the usual discovery,
+  library link and banner once the stamp is there. An install with the runtime already applied also starts them at t0.
+  A pack-file row, `BASE_LIBRARY` and a shared store start them after the tree, as before. The unpack's own seconds join
+  the install's ledger (a span may begin before the install's shell did; the timeline writer takes a negative start).
+  A dead or missing apply fails the install by name. Expected: Pod to App ready becomes max(unpack, first models) plus the
+  checks and one ComfyUI start; measure it on the first live round.
+- 3.30.0: the lock page takes the key the customer already has (2026-10-26; decision D7 of the Install Speed work).
+  Exercised by the suite only (the form, the cookie, the backoff and the boot's console rule against a fake ComfyUI
+  and a fake pod; no live pod). A template that locks its links used to leave the customer a detour: open the pod's Logs
+  tab, find the printed link, open each link once. With `BASE_LINK_TOKEN_FROM=<NAME>` the forwarder's key is the value
+  of the environment variable `NAME` (the base stays brand-neutral by taking the name; the template passes its own, so
+  the customer types what they already have).
+  - **The form.** The 401 page gains one password field and one button (plain words, no brand) that POST the key to the
+    reserved path `/__base_unlock` on the same host, on every port. A constant-time match answers with the cookie and a
+    303 to the page the visitor asked for (`next`, a local path only: `//host` and absolute URLs become `/`); a miss
+    shows the form again with "That key did not match. Check it and try again."; a key pasted with spaces around it
+    still matches. `?token=` keeps working.
+  - **The cookie holds an HMAC of the key, not the key.** The customer's own key is a credential for more than this pod,
+    so the browser stores `HMAC-SHA256(key, "base_link cookie v1")` (same after a restart, so the install's forwarder
+    restart does not send the customer back to the form). A cookie made by the older rule (the key itself) is not
+    accepted in this mode; with `BASE_LINK_TOKEN` nothing changes.
+  - **Backoff.** Per address: five misses are free, the sixth makes the address wait 2 s, then 4, 8 … up to 5 minutes;
+    a try during the wait answers 429 with `Retry-After` and is not compared (so the right key does not open it
+    either); a match clears the address; an address quiet for 15 minutes is forgotten; at most 4096 are kept; an IPv6
+    address counts as its /64. The address is the TCP peer, deliberately not `X-Forwarded-For` (a header the guesser
+    writes cannot rate-limit the guesser). Behind a proxy that is the proxy's address, shared by everyone: a stranger's
+    misses can make the form wait for the owner, and the `?token=` link (not behind the backoff) is the way round it.
+  - **Never logged, forwarded or written.** The forwarder logs no request. The unlock POST is answered by the forwarder
+    and never reaches ComfyUI, the cookie is stripped as before, and the key is not put in argv or `state/tokens.env`.
+  - **The boot.** `boot_link_token` reads `BASE_LINK_TOKEN_FROM` (the pod's env, else PID 1's), then `NAME`'s value (the
+    same way), exports both for the forwarder and saves nothing; `NAME` empty or not a variable name falls back to the
+    usual key (generated, saved, its links printed on the console). `boot_console_links` prints no token line for a key
+    from the environment (as for any env-supplied key: only a key the boot MADE is printed) and says once on the
+    console: "The links ask for your key (NAME): open ComfyUI from the Connect tab and type it once."
+  - The links lock only with `BASE_LINK_LOCK=1`, as before; `BASE_LINK_TOKEN_FROM` alone does not turn the lock on.
+    `podctl status` still prints links that carry a `?token=` only for a key the machine holds; for a key from the
+    environment it has none to print.
+- 3.29.3: the runtime's parts are independent zstd tars, fetched and unpacked in parallel (2026-10-26). Exercised by the
+  suite and by a hand run of `runtime.py build`/`apply` and `base.sh runtime-apply` on a small tree on macOS (local folder
+  and a loopback http server); not on a live machine, so the GB/s on a B200 is still unmeasured. The format of 3.1.0 (one
+  gzip stream cut into slices, fetched one at a time with curl) is gone: no runtime was ever published, and an old
+  manifest (`format` 1) is refused by name ("capture it again"). `runtime-capture` writes `runtime.NNN.tar.zst`, each with
+  the directories above its files so any part unpacks alone and in any order (a hard link only points inside its own
+  part). `runtime-apply` takes `--jobs` (default 8) and `--parts <links.json>`, runs `py/runtime.py apply` (fetch with curl,
+  size and sha256, `zstd -dc | tar -x`, one worker per part, largest first), and records one RUNTIME row in the timing
+  ledger: wall seconds, packed and unpacked GB, GB/s, with the busy seconds of fetch, verify and unpack in its text. Only
+  https is fetched (and a loopback http for tests). An Update that fails midway puts the old venv and packs back. A
+  corrupt part no longer stops the apply before anything unpacks (parts unpack as they land); it fails the apply, named,
+  and no stamp is written, so no install runs from a half-applied runtime. Needs `zstd` (a one-package apt install where
+  the machine lacks it).
+- 3.29.2: `runtime.json`'s `driver_min` is the floor the runtime's wheels need (2026-10-26, Fixes
+  SoulCraft-Org/ComfyUI-Base#2). Exercised by the suite only (no pod, no live capture). `runtime-capture` wrote the
+  capture machine's own driver major, so a runtime captured on a 615 machine was refused by the driver gate on every
+  580 and 595 image before any download, though its cu130 wheels run on 580. It now reads `torch.version.cuda` from the
+  venv and `py/runtime.py driver_floor` maps the CUDA major to NVIDIA's minor-version-compatibility floor (13 -> 580,
+  12 -> 525, 11 -> 450); `build` takes `--torch-cuda` (required, replacing `--driver-min`) and the manifest records
+  `cuda` beside `driver_min`. A torch build with no CUDA, or a CUDA major outside the table, stops the capture by name
+  instead of writing a floor by accident. No runtime has been published, so no existing manifest carries the old value.
+- 3.29.1: the OS stage installs `libegl1` and `libgles2` (2026-10-26). Exercised by the suite's text checks only (no pod,
+  no apt run). MediaPipe 1.1.1's `libmediapipe.so` links `libEGL.so.1` and `libGLESv2.so.2` even on CPU (found by the
+  Character Swap package's quality CI: `OSError: libEGL.so.1`), so a pod without them left that package's `head_pose`
+  and `expression` scores blank. Both are Ubuntu 24.04 (noble) `main` packages, 1.7.0-1build1 (libglvnd). The base's own
+  list in `lib/15-system.sh` (`python3-venv ffmpeg`, plus `nfs-common` and `openssh-server` where needed) gains them, and
+  so does the Verda startup's `ensure_packages`. A package that needs them must raise its `BASE_MIN` to 3.29.1.
+- 3.29.0: RunPod create's CUDA filter (2026-10-26), a blocker for the Video Swapper 6.0 B200 run. Exercised against the
+  suite's fake RunPod only (no live create, no pod).
+  - **No `allowedCudaVersions`.** RunPod matches that list exactly, REST v1's enum stops at 13.0, and every B200, B300
+    and RTX PRO 6000 host with stock reported CUDA 13.2, so `["13.0"]` could never place one while GraphQL's stock
+    (no CUDA input) said "free". `create_body` no longer sends it; RunPod's v1 says no list is any CUDA.
+  - **The floor is checked on the placed pod.** `create_floor` (`--min-cuda`, else the image tag's, never below 13.0) is
+    held against REST v2 `GET /pods/{id}` `cudaVersion`, asked again for about 60 s while it is null (`pod_cuda`,
+    `wait_pod_cuda`, `check_pod_cuda`, `cuda_at_least`), with or without `--no-wait`, public and `--private`. Below
+    the floor, or never named: the pod is STOPPED (never deleted), a `STOP:` line says the version and the floor, and
+    `PodctlError` makes podctl exit 1. A network volume the call made stays, with the stopped pod on it.
+  - **Stock at the floor.** `create` passes the image and `--min-cuda` to `availability`, and `stock` then asks REST v2
+    `GET /catalog/gpus?include=AVAILABILITY&product=POD&cloud=SECURE&minCudaVersion=<floor>` (`catalog_stock`): data
+    centres whose availability is not NONE, still only those POST /pods takes and, for a network volume, those
+    GraphQL says take one. `podctl availability` with no image keeps the GraphQL view.
+- 3.28.0: the 6.0 install and GPU items (2026-10-26). Exercised against the suite's stand-ins only (no pod, no GPU).
+  - **cuDNN's default kernel cache off while it is broken.** cuDNN 9.22 added a default per-process cache of
+    runtime-compiled kernels; NVIDIA's cuDNN 9.25.1 release notes (Fixed Issues) fix "a data corruption issue in this
+    cache that could cause a segmentation fault" and say "For cuDNN 9.22-9.24, a workaround was to set the environment
+    variable `CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0`". torch 2.14.1 pins 9.24.0. The launch environment now carries it
+    while the venv's `nvidia_cudnn_cu*-<version>.dist-info` reads 9.22.0 up to 9.25.1, 9.25.0 included since its notes
+    fix nothing there (`lib/85-launch.sh` `_base_cudnn_version`, `_base_cudnn_cache_bug`; a directory name, no torch
+    import), at every start and boot. It turns a compile cache off and changes no kernel's result. The machine's own
+    value wins; a package cannot set the key.
+  - **Two more GPU classes, warnings only.** `py/gpu_fit.py` names `GB300` (NVIDIA's CUDA table: 10.3; 288 GB HBM3e; a
+    Grace aarch64 host) and `RTX-PRO-6000` (the RTX PRO 6000 Blackwell Server Edition: 12.0; 96 GB GDDR7, 97887 MiB
+    read). An architecture now fits only with 90 % of its class's memory, because `sm_120` is also an RTX 5090's: a 5090
+    is below `RTX-PRO-6000`, and a 34 GB MIG slice of a B300 is below `B300` by its numbers as it already was by its name.
+    A GB300's name never reads as a B300's.
+  - **The early downloads start before the clones.** When no row of the package's first set is a `custom_nodes/<Pack>`
+    file (whose dest is inside its pack) and uv's bootstrap need not wait for the OS stage's apt (that stage already
+    ran, the bootstrap venv exists, or the system Python has ensurepip), the downloads start right after the token
+    check, before the ComfyUI fetch, the version gate, the consolidation and the pack clones (`_base_early_first`);
+    otherwise after them, as before, and the second call finds them started. Expected: those stages' length, about
+    25 to 30 s, added to the overlap. A gate that then refuses the run stops the downloads with it; they resume.
+  - **podctl's install half: fewer round trips.** 3.24.0 already carries every ssh, scp and log fetch of a run on one
+    ControlMaster (the "46 s before the run" was measured before it, on 2026-10-17). Now the lease and
+    `state/host.env` go in one round trip (`lease_take_with`), the GPU gate and the `GPU_PREFER` note ask nvidia-smi
+    once (`gpu_probe(fit=True)`), and the master persists 600 s, not 120, so the Mac's own gate (minutes on a new zip)
+    no longer lets it lapse before the upload. The lines printed are the same. Expected: two round trips (about
+    0.3 s each to EU-RO-1) and, after a gate longer than two minutes, one handshake (about 1.8 s).
+  - **fetch-later starts small files first.** Behind a running server each file that lands can make a lane ready, so
+    `base.sh fetch-later` hands its queue over by size, smallest first, and the queue starts it that way
+    (`_BASE_FETCH_SMALL_FIRST`, set by fetch-later alone); the install's own queue still starts the largest first.
+  - **A package can set `--cache-ram 10 32`, off by default** (§4). A `HYGIENE_ARGS` row kept one value per flag, so
+    `--cache-ram 10 32` landed as `--cache-ram 10`; a `--cache-ram` row now keeps its one or two values
+    (`_base_args_package`, `_base_args_cache_ram`), checked at the declaration, never beside another cache mode, and
+    `HYGIENE_ARGS_REMOVE` takes both values out. Caching only: the same nodes run on the same inputs.
+  - **`LAUNCH_ENV` allows `RENDER_SPEED_LANCZOS_THREADS`**, the Render Speed pack's thread count for every lanczos resize
+    in the process (several frames at once, the same bytes; the package's CPU byte-compares), so a package can say
+    `LAUNCH_ENV=( "RENDER_SPEED_LANCZOS_THREADS=1" )`.
+
+- 3.27.2: the size cache is compared only on the text host that photographed it (2026-10-25). The same frontend
+  measured 17 of the Video Creator's nodes at other sizes on a Blacksmith ARM runner (the CI router's overflow) than
+  on the HF runner that made `sizes.json`, and `test_snapshot_sizes_cache_is_current` failed on a cache that was
+  right. `snapshot.py` now records the machine and a fingerprint of the fonts (`py/canvas.py` `text_host`) beside
+  the OS (3.8.2), and the test skips, saying why, on any other host; a cache without them counts as made on x86_64
+  (Linux, the HF runner) or arm64 (macOS).
+- 3.27.1: the canvas tools default to their own testbed port (2026-10-25). `snapshot.py`, `probe.py` and `panels.py` took
+  `--server` from `BASE_SERVER`, else `127.0.0.1:8199`. A runner Space now runs two runners, each with its own
+  `TESTBED_PORT` (8199 and 8299, workspace `ci/hf-runner/`), and a bare 8199 is the other runner's testbed mid-gate (a
+  package job reached it on 2026-10-25). The default is now `BASE_SERVER`, else `127.0.0.1:$TESTBED_PORT`, else 8199;
+  `test_build_tools_default_to_their_own_testbed_port` holds every `_build` tool to it.
+- 3.27.0: a first install starts ComfyUI beside its model downloads, not after them (2026-10-25). On 2026-10-17 the App's
+  cold start (16 s on a B200: Python, torch, CUDA and ComfyUI's own nodes; the custom nodes under 1 s) came after the
+  models join (30 s), prune, sync, the post-models hook, the import check and hygiene, though nothing in those needs a
+  server and the server needs none of them: ComfyUI's file lists re-check their folders, so a model that lands after the
+  start is listed. Now, when no server answers and `BASE_RESTART=1` (the case where the import check already rides the
+  launch, 3.15.0), the import check and hygiene run right after `pkg_pre_models` and ComfyUI is started there; `base_restart`
+  waits for that start at its old place and judges its imports from its own log slice. What ComfyUI reads only at start
+  (the launch args, `extra_model_paths.yaml`, the custom_nodes folders and their top-level .py files, the ComfyUI tree,
+  moved Python packages) is fingerprinted at the start; if any of it changed by the restart, the early server is stopped
+  and started again exactly as before, so the worst case is the old single start plus a wasted one. A MODELS row that
+  delivers code (`custom_nodes/<Pack>/x.py`) is waited for at its declared size (`BASE_EARLY_CODE_WAIT`, 60 s) before the
+  start; a run that stops before its restart stops the server it started; a boot-unit host starts through the unit at the
+  end, as before. The early server listens on 127.0.0.1 (ComfyUI always does since 3.14.0), and the app ports that front
+  it start at boot install, after base_models and base_prune, so no prompt can reach it while a snapshot
+  folder fills or prune moves a file. The server is asked whether it is up every 0.5 s (every second since 3.26.0). `BASE_EARLY_LAUNCH=0` keeps the old order.
+  A package that registers model folders from `pkg_post_models` (a video package's 5.9.0 did; its 5.9.1 moved them) gets the second
+  start until it moves those lines to `pkg_hygiene`. Expected: up to 16 s less pod to App ready, capped by the join's
+  length. Exercised by the unit tier's stand-ins only (no pod).
+- 3.26.0: the Python side of a fresh install (Paul's priority 3, install speed, 2026-10-25). Read from the last Video
+  Replacer pod (yswh3tkypxhxev, `runpod/comfyui:1.4.7-cuda13.0`, base 3.20.0) and the code: VENV's 116 s held the uv
+  picks (about 14 uv compiles, measured at about 1 s each cold and near 0 warm, so a few seconds in all), 4.1 GB of
+  wheels in 165 packages downloaded and unpacked (the torch closure, 3.0 GB in 23 of them, from download-r2.pytorch.org
+  and pypi.nvidia.com; 1.1 GB from PyPI), the verify (`import torch` 3.5 s), and the `cuda-libraries-dev-13-0` apt
+  that 3.22.0 moved beside it. (1) The template image's head start (§5): a venv the run must build reads uv's cache from
+  the image's seed (`$BASE_IMAGE_SEED/.cache/uv`) for the rest of the run, so the wheels the image holds are linked or
+  copied instead of fetched, and the same versions as a cold cache: its index listings (`simple-v*`, `flat-index-v*`,
+  from the build day) are dropped first, since an index sending a long max-age would have uv trust them and resolve
+  older (the unit tier shows exactly that against a local index, then the empty freeze diff with the guard); the
+  image's CPython is copied onto a volume that has none of that minor; CONSOLIDATE no
+  longer reports or sizes the seed's tree and venv. The image carries the cache from runpod-template's own change of
+  the same day. (2) The torch pick is answered once per run for each minor and venv backend (`_base_torch_pick`): a fresh
+  venv asked twice, four or five compiles each time; a failed pick is asked again. (3) The newest pass's outdated scan
+  leaves the torch closure out of the query (`--exclude`), not only out of its answer. (4) On RunPod, dpkg runs with
+  `--force-unsafe-io`: the container disk is the image's again at every start, so a crash mid-unpack leaves nothing
+  behind (a VM keeps every fsync). (5) The restart's readiness poll asks every second, not every two. Expected, not
+  measured: on the image, VENV from 116 s to about 25-35 s (nothing of the 4.1 GB fetched or unpacked unless it moved,
+  cuBLAS already in the CUDA devel base, the second pick gone); on `runpod/comfyui`, 2-5 s (the pick, half a second of
+  the poll on average) and SYSTEM, off the critical path, shorter by dpkg's fsyncs. Not done here: the run's one
+  directory scan, at CONSOLIDATE, still walks the image's cache (its prune list, `_base_cache_prune` in lib/50-models.sh,
+  names the run's own caches, and the swap comes later, at the venv). The
+  unit tier covers each (`suite/test_image_start.py`; the pick, the scan, dpkg and the poll beside their neighbours).
+  No pod used.
+- 3.25.0: the customer's own downloads, as fast as each source allows (Paul, 2026-10-25: every model, LoRA and file
+  comes from the buyer's own Hugging Face and Civitai accounts). Read first, from the sources' own documentation. The
+  Hub is fully Xet-backed and `hf_transfer` is deprecated (`HF_HUB_ENABLE_HF_TRANSFER` no longer does anything);
+  `HF_XET_HIGH_PERFORMANCE=1`, already set, is the fast path, so the Hub leg keeps hf. Civitai answers its download
+  URL with a 307 to a presigned storage URL (24 h), whose storage serves byte ranges (206) and refuses a HEAD; it states
+  each file's SHA256 at `/api/v1/model-versions/<id>`, and its documentation strongly prefers the
+  `Authorization: Bearer` header to a `?token=` that "leaks the token into access logs and caches". What changed.
+  (1) Civitai rows: `https://civitai.com/api/download/models/<versionId>`, with only Civitai's own file selectors in the
+  query; a `token=` (or anything else) in the URL is refused when the rows are validated. civitai.com joins §0.9's
+  hosts. (2) `py/fetch_ranges.py`, standard library only, on the system Python: it follows the redirect itself, so
+  `CIVITAI_TOKEN` (a 0600 header file, as every Hub `curl` already uses) reaches civitai.com and never the storage, argv,
+  a URL or the log; it asks for byte 0 to learn the size (a size that is not the row's stops before anything is
+  written), then fetches 8 MiB blocks over up to 16 kept-alive connections, each written at its offset and hashed from
+  memory in order, so the sha256 needs no second read of the file (workers stay at most connections + 4 blocks ahead
+  of the hash: about 160 MiB per file). The expected hash is `models.sha256`'s, else the one Civitai states for that
+  file. `<file>.ranges` records the hashed prefix; an interrupted transfer resumes from it. Because the file has its
+  full size from the first block on, the model stage moves it only on the helper's own verdict, never on its size.
+  A refusal (401/403) says once whether `CIVITAI_TOKEN` is missing or refused; a 404, a wrong size or a wrong hash is
+  said once too. A GitHub file of 256 MiB or more takes the same leg; a smaller one keeps curl. `gen-models` reads a
+  Civitai row's size and `gen-hashes` its sha256 through the same helper. (3) Six files at once on every machine:
+  the three under 32 GiB never applied on a pod (a container reads the host's `/proc/meminfo`), and hf_xet's buffers are
+  bounded since 1.3.0. (4) `hf cache verify --help` was asked once per file, a Python start inside the file's slot; it is
+  asked once before the queue forks. (5) When the fetch venv cannot be built, the Civitai and GitHub files still start
+  beside the venv build (they need no hf). (6) A per-file record beside the run's log, `<run>.downloads.tsv`: start
+  and end (epoch seconds, to the microsecond on bash 5), seconds, bytes, MB/s (10^6 bytes), the sha256 seconds, the
+  source (`hf`, `civitai`, `github`), the transport (`hf-xet`, `ranges x<n>`, `curl`) and the result, for every file
+  the early pass, the model stage and `fetch-later` fetched; podctl fetches it with the rest of `state/logs`, and the
+  console's line for each file now names its source and transport. `.github/workflows/download-throughput.yml` times
+  each leg on a runner (a public Hub VAE and a public Civitai LoRA) and writes the MB/s to the run's summary. The unit
+  tier covers the helper against a local Civitai stand-in (redirect, token on the first hop only, ranges, resume, the
+  stated hash, a source without ranges), the row rules, the leg choice, the record, the held move and the probe asked
+  once. No pod used; the Hub leg is unchanged except for the probe.
+- 3.24.0: `podctl install` spends seconds, not most of a minute, around the package run (2026-10-25). The 2026-10-17
+  release run's "16:10 install, 395 s package run" was read as 9.5 minutes of driver overhead. It was not: the first
+  attempt died in the run script before podctl ran, the pod was stopped, fixed and resumed 11:39 later, and the install
+  clock was never re-stamped; the real `podctl install` took 277 s, and the "395 s" is the stage table's sum, which
+  counts the background stages beside the foreground (the package run's wall clock was 221 s). podctl's own share was
+  about 54 s: 46 s before the run, 8 s after. Most of it was connections: about 21 ssh handshakes, each about 11 round
+  trips (1.8 s to EU-RO-1 from the maintainer's Mac at 164 ms), because no command shared a connection. Now one
+  ControlMaster per machine carries every ssh, scp and log fetch of a run (2 round trips a command, measured 0.13 s
+  against 0.77 s); its master carries ClearAllForwardings like every command session, so it never binds the Host
+  block's forwards, and a dead master is retried once only when the session request failed before the command
+  started (a second launch would be a second install). Every zip is checked first and all of them go up in one upload
+  (probe, one scp, one check), and a zip already there with the same size and sha256 is not sent again. The poll waits
+  on the machine, so a finished step is seen within a second instead of 2.5 s later on average plus a handshake. The
+  lease is read once, and released in one round trip; the volume size is recorded once per run. A stale package zip now
+  stops before the base changes anything. Expected: about 35 s less per install to EU-RO-1, about 10 s to US-CA.
+  Exercised against the suite's stand-ins only (no pod).
+- 3.23.0: `podctl` binds no vendor port on the workstation when told not to (2026-10-24). The tunnel's local sides were
+  the remote ports plus `PODCTL_TUNNEL_OFFSET` (0-1000), so every session bound 8188, 8888, 9199 and 11434 or a few
+  ports above them. A workstation whose rule is that local listeners sit in each account's own block (3100-3199 for the
+  first account, 3200-3299 for the next) and that the vendors' numbers stay empty could not follow it: no offset
+  reaches 31xx from 8188. `PODCTL_TUNNEL_BASE=<port>` now puts machine N's local sides at `base+10N` onwards: ComfyUI,
+  JupyterLab and 9199 at the first three slots, the app ports after them by port, more than ten refused. Unset, nothing
+  changes. The ssh-config block, `tunnel`, `jupyter`, `mcp --over tunnel` and `create`'s hint read the same numbers
+  (`tunnel_local_ports`). That also fixes an older split: `podctl tunnel`'s default ports were bound as 8188 and 8888
+  whatever the offset said, while ssh-config, jupyter and mcp printed the offset ports; a plain port is now sent as
+  LOCAL:REMOTE whenever the two differ. 11434 (Ollama's) is no longer forwarded. 2.9.1 kept it in case a package ran an
+  inference server on the machine. No package of the repositories around the base does (photo-auditor dropped its
+  Ollama tier in 2.0.0, 2026-10-17), and a workstation that keeps 11434 empty cannot run a session that binds it. The
+  machine still reserves the port for APP_PORTS, and `--port 11434` forwards it. `SSH_BLOCK` is built from
+  `TUNNEL_SERVICES` now, so the two cannot drift apart. The unit tier covers the block and its refusals, the tunnel
+  plan under a base and under an offset, and the block's lines. No pod used; this changes only the Mac side.
+- 3.22.1: two CI fixes (2026-10-18). (1) A package's CI log named 4 of the 7 tests that failed (2026-10-17): the
+  runner's `-rs` put only skips in pytest's short summary, and `_build/verify.sh` cut the FAILURES section with
+  `| head -200`, which also broke awk's pipe. The runner now passes `-rfEs`, and `_verify_failures` prints every FAILED
+  and ERROR line of the short summary first, then the sections, capped inside awk. Under a package script's
+  `set -Eeuo pipefail` a red suite also tripped the base's ERR trap at the pipeline into tee (exit 4, blaming tee) before
+  the summary; the runner now reads pytest's own status with `&& rc=... || rc=...`, which neither trips the trap nor needs
+  pipefail. (2) `sage-wheels.yml`: a pull request rebuilds every arch and runs the publish step dry, but the write-once
+  check exited 1 on the first arch the release already held (run 39073460610). An arch whose published
+  `sm_<arch>.sha256` is this build's sum is now skipped; any other clash (a different build, or a wheel whose sum never
+  landed) warns in a dry run and still fails a real publish, before anything uploads. The unit tier covers the failure
+  report, the runner under errtrace with the base's traps, and the publish step against a fake gh. No pod used.
 - 3.22.0: install speed on the critical path, and a clock that shows it (Paul's priority 3, 2026-10-17). Read from the
   last Video Replacer pod (1x B200, EU-RO-1, base 3.20.0, every row: 42 files, 295.5 GB): about 5:17 from create to the
   App for a fresh install, with the 66.3 GB B300-only file the long pole (147 s with its sha256) and VENV 116 s beside
@@ -874,10 +1286,10 @@ for any invocation that somehow arrives without the environment. The suite asser
   expect. The rounding cases now run with `_base_cpus_online` stubbed to 64, and the cap is proved with the host's own
   count and a stubbed 2-CPU host. The launch tests drop every key of `BASE_LAUNCH_ENV_KEYS` (read from the base) and
   `CT2_*` from their environment. Only the suite changed; the base's code is as in 3.20.2.
-- 3.20.2: the testbed links the newest copy of a pack two packages vendor (2026-10-17). FLUX 3 Klein and the Video
-  Replacer both vendor ComfyUI-Content-Gate (one folder name, one set of node classes), and `testbed.sh` linked each
-  package's copy into `custom_nodes` by folder name, so whichever package was walked last won (the Replacer's 1.5.0 in
-  workspace integration run 39045535460, failing Klein's comfyui and server tiers). It now keeps the newest version,
+- 3.20.2: the testbed links the newest copy of a pack two packages vendor (2026-10-17). An image package and a video
+  package both vendor ComfyUI-Content-Gate (one folder name, one set of node classes), and `testbed.sh` linked each
+  package's copy into `custom_nodes` by folder name, so whichever package was walked last won (the video package's 1.5.0 in
+  workspace integration run 39045535460, failing the image package's comfyui and server tiers). It now keeps the newest version,
   the rule a pod already follows (`lib/62-own-packs.sh`): `py/own_packs.py newest` picks one folder per pack name, a
   copy with no version loses to one with a version, the same version keeps the first and names two different contents
   under it. `--status` lists each vendored pack's version and the package it comes from.
@@ -990,7 +1402,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   pure tiers (`<name>-script.sh test quick`: every tier the suite declares except `BASE_HEAVY_TIERS`, those that need a
   live machine), the package's `*.api.json` prompts against its cached `/object_info` (`_build/objinfo.py check`: classes,
   required inputs, links and their types, ranges, combo options, from the output nodes back, as ComfyUI's validator reads
-  the schema; `objinfo.py save` takes the cache from the pod through `podctl tunnel`, in the shape image-creator-krea-2
+  the schema; `objinfo.py save` takes the cache from the pod through `podctl tunnel`, in the shape an image package
   already commits), and the brand's zip guard when its `brand.toml` names one (`zip_guard`). **Tier 1** is `verify.sh`,
   once per release on a free runner; `_build/cloud-verify.md` is the brief for a Claude Code cloud session (what its
   GitHub proxy allows: no check runs, statuses or deployments). **Tier 2**, `podctl runner <pod>`, opt-in: the machine as
@@ -1016,7 +1428,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   the runner refusing a foreign server.
   Also in 3.16.0: a re-install that takes the "already installed" shortcut (3.11.0) prints the models line every run prints
   (`models ok N in place · moved 0 · downloaded 0 · failed 0`). It printed only "install skipped", and every package's
-  install test, which reads "downloaded 0" from a second run, failed on the free CI runner (image-creator-flux-3-klein#6,
+  install test, which reads "downloaded 0" from a second run, failed on the free CI runner (an image package's issue #6,
   video-creator#6, photo-auditor#6). The second-run test now asserts the line.
 - 3.15.3: a failing suite's report keeps each failing test whole (2026-10-16). `_build/verify.sh` printed only 12 to 24
   lines of a failure, so a long assertion lost its cause in CI (it hid a Video Replacer failure's reason). It now prints
@@ -1026,8 +1438,8 @@ for any invocation that somehow arrives without the environment. The suite asser
   packs' requirements step to skip the set the venv build had just installed; it resolved it again (138 s on the pod)
   because the build took its fingerprint before reading the torch constraints from the venv again, and the install had
   moved setuptools and the like. The build now reads them first, as the packs' step does. Measured before the fix, two
-  fresh pods made side by side (H100 80GB HBM3, EU-FR-1, `runpod/base:1.4.0-cuda1300-ubuntu2404`, a network volume, the
-  MiniMax H3 Video Continuer 1.0.5 and its 41.1 GB, `--no-gate --no-suite`), wall clock from `podctl create` to the
+  fresh pods made side by side (H100 80GB HBM3, EU-FR-1, `runpod/base:1.4.0-cuda1300-ubuntu2404`, a network volume, a
+  video package at 1.0.5 and its 41.1 GB, `--no-gate --no-suite`), wall clock from `podctl create` to the
   workflow listed through the public proxy: 3.9.2 2113 s, 3.11.0 1716 s (397 s less, 19 %). Stage by stage, 3.9.2 then
   3.11.0: venv 743 / 689, newest 467 / 467, downloads 226 / hidden (127 s beside the venv chain; the join waited under
   a second), import check 203 / 144, packs pip 127 / 138 (the defect above), restart 89 / 87, BOOT 83 / 1 (the tools
@@ -1142,8 +1554,8 @@ for any invocation that somehow arrives without the environment. The suite asser
   an early file is counted once (as downloaded), a row the early pass left alone is fetched there, and a file it could
   not get fails the run by name with no second round of attempts. A run that stops before the join stops its
   downloads (they resume from staging). `BASE_MODELS_FOREGROUND=1` keeps the old order. Measured on RunPod, two fresh
-  pods made side by side (H100 80GB HBM3, EU-FR-1, `runpod/base:1.4.0-cuda1300-ubuntu2404`, a network volume, the MiniMax
-  H3 Video Continuer 1.0.5 with its 41.1 GB of models, `--no-gate --no-suite`), wall clock from `podctl create` to the
+  pods made side by side (H100 80GB HBM3, EU-FR-1, `runpod/base:1.4.0-cuda1300-ubuntu2404`, a network volume, a
+  video package at 1.0.5 with its 41.1 GB of models, `--no-gate --no-suite`), wall clock from `podctl create` to the
   workflow listed through the pod's public proxy: 3.9.2 1610 s, 3.11.0 1471 s (139 s less; 167 s less from the pod's
   first ssh to the end of the install, against a 181 s download stage in 3.9.2). The early downloads ran 605 s at 70 MB/s
   beside the venv, packs pip and newest pass (304 MB/s alone in 3.9.2), and the join waited under a second. Where 3.9.2
@@ -1158,7 +1570,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   pod started; at most 15 minutes. (2) After its own reset it kept polling the OLD ssh port: the API answers with the pod as it was for a while
   after the PATCH, and RunPod had moved 22/tcp (20424 to 36944). It now waits for `lastStartedAt` to move and looks for
   sshd on the port the pod has now, re-read on every try. (3) `podctl install` on a package folder not named after its
-  package (`vr` for `video-replacer-minimax-h3`) stopped on "vr has no zip (vr-runpod.zip)"; it now says the folder's
+  package (a short folder name for a video package) stopped on "vr has no zip (vr-runpod.zip)"; it now says the folder's
   name must be the package's and names the one to rename it to. (4) `podctl create` offered data centres a pod cannot be
   created in: the stock view names more than REST v1 `POST /pods` takes (its `dataCenterIds` enum has 30 ids and lacks
   US-NE-1, a B200 location: a schema 400), and it picked ones that take no network volume (US-NC-1, US-MO-2, EUR-IS-2:
@@ -1405,7 +1817,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   Update (a newer `runtime-apply`) is followed by the packages' installs.
 
 - 3.1.0: a buyer's machine, opt-in end to end, with every plain run unchanged. A proven runtime: `runtime-capture` on
-  a green machine (parts under GitHub's 2 GiB and `runtime.json`, `py/runtime.py`), `runtime-apply` on a buyer's, and
+  a green machine (gzip slices of one stream under GitHub's 2 GiB, and `runtime.json`, `py/runtime.py`; re-cut in 3.29.3), `runtime-apply` on a buyer's, and
   `BASE_RUNTIME` installing from it with no OS, git, pip or uv step (§0.3's one exception, §0.12). The first flow
   first: `MODELS_LATER` and `BASE_STAGED=1` stand in for the rest, which a detached `base.sh fetch-later` brings behind
   the started server while `state/progress.json` reports each file. `BASE_FETCH_JOBS` fetches several files at once

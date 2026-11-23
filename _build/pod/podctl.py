@@ -76,7 +76,8 @@ for _n in ("DEFAULT_API_URL", "PLACEHOLDERS", "SECRET_NAMES", "load_api_key", "A
            "link_token", "named_volumes", "DEFAULT_VOLUME_NAME",                                               # 3.14.0
            "balance", "BALANCE_QUERY", "GPU_NOTES", "FRESH_POD_GB",                                            # 3.18.0
            "REF_VARS", "env_ref", "env_refs", "refs_line", "DEFAULT_API_V2_URL",                   # 3.19.0
-           "stock_count", "count_rows", "COUNT_FIELDS", "pod_rate", "pods_spend", "unit_price"):   # 3.20.0
+           "stock_count", "count_rows", "COUNT_FIELDS", "pod_rate", "pods_spend", "unit_price",    # 3.20.0
+           "cuda_key", "cuda_at_least", "catalog_stock", "pod_cuda", "wait_pod_cuda", "check_pod_cuda"):   # 3.29.0
     _GLOBALS[_n] = getattr(_runpod, _n)
 del _n
 
@@ -105,21 +106,30 @@ VOLUME_ROOT = "/workspace"                              # the persistent root on
 # 2.11.0: this was a hard-coded map of one brand's three machine aliases, which meant anybody else's fleet
 # silently shared 8188 and could only fix it by editing the base - the one thing a consumer must never do.
 TUNNEL_OFFSET_ENV = "PODCTL_TUNNEL_OFFSET"
-# 11434 is Ollama's. The base installs no inference server and never will: the port is forwarded because a
-# PACKAGE may run one on the machine and talk to it on loopback, which is the shape a package uses when its
-# whole point is that nothing leaves the box. Forwarding it costs nothing when no package does, and its
-# absence would be silent and confusing. It is not a leftover; do not remove it without checking the
-# packages of the repository around the base.
-TUNNEL_SERVICES = [("comfy", 8188), ("jupyter", 8888), ("metrics", 9199), ("ollama", 11434)]
+# 3.23.0: an offset moves the local ports but keeps them on the vendors' numbers (8188 and 8888 plus a little),
+# and a workstation may have a rule that its local listeners sit in a block of its own: one account's 3100-3199,
+# say, beside another account's 3200-3299, on one machine. No offset in 0-1000 reaches such a block, so
+# $PODCTL_TUNNEL_BASE puts every local side there instead: machine N of the fleet (its offset) takes the ten
+# ports base+10N .. base+10N+9, the services below at fixed slots and the app ports after them, by port. The
+# remote ports never move. Unset, nothing changes. Which block is a fact about somebody's workstation, so it
+# comes from the environment like the offset, and the base names no machine.
+TUNNEL_BASE_ENV = "PODCTL_TUNNEL_BASE"
+TUNNEL_STRIDE = 10
+# 9199 is a metrics exporter's: the base runs none, but a PACKAGE may run one on the machine and read it on
+# loopback. 3.23.0: 11434 (Ollama's) is no longer forwarded. No package of the repositories around the base
+# talks to an inference server on the machine (the one that did, a photo auditor, dropped it in its 2.0.0),
+# and a workstation rule that keeps 11434 empty cannot coexist with a session that binds it. The machine still
+# reserves the port (lib/75-boot.sh, py/app_proxy.py), so a package that runs one later reaches it with
+# `podctl tunnel <pod> --port 11434`, which lands in the block like any other port.
+TUNNEL_SERVICES = [("comfy", 8188), ("jupyter", 8888), ("metrics", 9199)]
 SSH_BLOCK = ("Host {alias}\n  HostName {host}\n  Port {port}\n  User {user}\n  IdentityFile {key}\n  StrictHostKeyChecking accept-new\n"
-             "  LocalForward {comfy} localhost:8188\n  LocalForward {jupyter} localhost:8888\n"
-             "  LocalForward {metrics} localhost:9199\n  LocalForward {ollama} localhost:11434\n")
+             + "".join("  LocalForward {%s} localhost:%d\n" % (name, remote) for name, remote in TUNNEL_SERVICES))
 
 
 def tunnel_offset(env=None):
     """How far this machine's local ports sit from the defaults. $PODCTL_TUNNEL_OFFSET, else 0. A bad value is
     refused rather than silently treated as 0, because 0 is exactly the collision it was set to avoid."""
-    raw = ((env or os.environ).get(TUNNEL_OFFSET_ENV) or "").strip()
+    raw = ((os.environ if env is None else env).get(TUNNEL_OFFSET_ENV) or "").strip()
     if not raw:
         return 0
     try:
@@ -131,12 +141,52 @@ def tunnel_offset(env=None):
     return off
 
 
+def tunnel_base(env=None):
+    """The first local port of this workstation's block, $PODCTL_TUNNEL_BASE, else None (the remote ports plus
+    the offset, as before 3.23.0). Refused, never ignored, when it is not a whole number or when this machine's
+    ten ports (base + 10 x offset onwards) would leave 1024-65535: ignoring it would bind the very ports it was
+    set to keep empty."""
+    env = os.environ if env is None else env
+    raw = (env.get(TUNNEL_BASE_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        base = int(raw)
+    except ValueError:
+        raise PodctlError("%s=%r is not a whole number" % (TUNNEL_BASE_ENV, raw))
+    first = base + TUNNEL_STRIDE * tunnel_offset(env)
+    if base < 1024 or first + TUNNEL_STRIDE - 1 > 65535:
+        raise PodctlError("%s=%d with %s=%d puts this machine's ports at %d-%d, outside 1024-65535" % (
+            TUNNEL_BASE_ENV, base, TUNNEL_OFFSET_ENV, tunnel_offset(env), first, first + TUNNEL_STRIDE - 1))
+    return base
+
+
+def tunnel_local_ports(remotes, env=None):
+    """{remote: local} for every plain port a tunnel forwards. Without a base: the remote port plus the offset.
+    With one: the services at their fixed slots, every other port after them in port order, so one app keeps
+    one local port however the list was gathered. More ports than the stride holds is refused, because the
+    eleventh would sit in the next machine's slots."""
+    env = os.environ if env is None else env
+    off, base = tunnel_offset(env), tunnel_base(env)
+    remotes = [int(r) for r in remotes]
+    if base is None:
+        return {r: r + off for r in remotes}
+    fixed = {remote: slot for slot, (_, remote) in enumerate(TUNNEL_SERVICES)}
+    others = sorted(set(r for r in remotes if r not in fixed))
+    slots = dict(fixed)
+    slots.update((r, len(fixed) + i) for i, r in enumerate(others))
+    if max([slots[r] for r in remotes] + [0]) >= TUNNEL_STRIDE:
+        raise PodctlError("%d ports to forward, but a machine has %d local slots under %s (%s): forward fewer with --port" % (
+            len(fixed) + len(others), TUNNEL_STRIDE, TUNNEL_BASE_ENV, ", ".join(str(r) for r in others)))
+    return {r: base + TUNNEL_STRIDE * off + slots[r] for r in remotes}
+
+
 def tunnel_locals(alias=None, env=None):
-    """The local port for each service on this machine: the remote port plus this deployment's offset, so two
-    machines never contend for one number. `alias` is accepted and ignored; it is kept so the call sites and
-    the suite read the same as before 2.11.0."""
-    off = tunnel_offset(env)
-    return {name: remote + off for name, remote in TUNNEL_SERVICES}
+    """The local port for each service on this machine: the remote port plus this deployment's offset, or its
+    slot in $PODCTL_TUNNEL_BASE's block (3.23.0), so two machines never contend for one number. `alias` is
+    accepted and ignored; it is kept so the call sites and the suite read the same as before 2.11.0."""
+    local = tunnel_local_ports([remote for _, remote in TUNNEL_SERVICES], env)
+    return {name: local[remote] for name, remote in TUNNEL_SERVICES}
 
 
 def _block_for(alias, user, key):
@@ -192,13 +242,21 @@ def provider_for(name=None, base_dir=None, env=None):
     return cls()
 
 
+def host_env_write(prov):
+    """3.28.0: (the shell that writes state/host.env, the line podctl prints for it): write_host_env's command, so an
+    install can send it in the lease's own round trip (lease_take_with)."""
+    text = prov.host_env()
+    cmd = "mkdir -p %s && printf '%%s' %s > %s" % (_sq(VOLUME_ROOT + "/comfy-base/state"), _sq(text), _sq(VOLUME_ROOT + "/comfy-base/state/host.env"))
+    return cmd, "host    %s (state/host.env: %s)" % (prov.name, " ".join(text.split()))
+
+
 def write_host_env(prov, env=None):
     """state/host.env on the machine, so the base knows which host it runs on (BASE_HOST) and where its volume is (BASE_VOLUME)."""
-    text = prov.host_env()
-    r = ssh_run("mkdir -p %s && printf '%%s' %s > %s" % (_sq(VOLUME_ROOT + "/comfy-base/state"), _sq(text), _sq(VOLUME_ROOT + "/comfy-base/state/host.env")), env=env)
+    cmd, line = host_env_write(prov)
+    r = ssh_run(cmd, env=env)
     if r.returncode != 0:
         raise PodctlError("could not write state/host.env on the machine: %s" % (r.stderr or r.stdout).strip()[-300:])
-    return "host    %s (state/host.env: %s)" % (prov.name, " ".join(text.split()))
+    return line
 
 
 def write_ssh_config(path, host, port):
@@ -253,6 +311,7 @@ def mac_public_key(path=None):
 
 def _ssh_hostname():
     import subprocess
+    _mux_ready()
     r = subprocess.run(SSH_CMD + ["-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=accept-new", SSH_ALIAS, "hostname"],
                        capture_output=True, text=True)
     if r.returncode != 0:
@@ -263,9 +322,74 @@ def _ssh_hostname():
 # ---------------------------------------------------------------- stop / start / restart, upload
 
 
-SSH_CMD = ["ssh", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=accept-new"]
-SCP_CMD = ["scp", "-q", "-o", "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=accept-new"]
+# 3.24.0: ONE ssh connection per machine, not one per command. Every ssh_run, scp and log fetch opened its own, and a
+# handshake costs about 11 round trips: 1.8 s to EU-RO-1 from this Mac (164 ms, measured), about 21 of them per
+# `install`, which was most of the 54 s the 2026-10-17 run spent around its package run. Multiplexed, a command costs
+# 2 round trips (0.13 s against 0.77 s to GitHub's sshd, measured). The master is made by whichever command comes first
+# and carries ClearAllForwardings like every command session, so it never binds the Host block's LocalForwards; the
+# tunnel is its own session (-F /dev/null) and is untouched. %C hashes host, port and user, so a new pod, or a new
+# mapping after a start, gets its own master. A unix socket path holds at most 103 bytes on macOS, so a home too deep
+# for <dir>/%C runs unmultiplexed, as before. PODCTL_SSH_MUX=0 turns it off.
+# 3.28.0: 600, not 120. An install's master opens with the lease, then the Mac's own gate (the package's suite from its zip,
+# minutes on a zip it has not seen) leaves it idle; at 120 s it lapsed there and the upload after the gate paid a fresh
+# handshake (about 11 round trips, 1.8 s to EU-RO-1). A stopped machine's master still dies within a minute
+# (ServerAliveInterval x ServerAliveCountMax), and stop, start and restart close it first (mux_close).
+SSH_MUX_PERSIST = 600            # seconds a master outlives its last command
+SSH_MUX_STALE = re.compile(r"mux_client_request_session: (?:read from master failed|session request failed)|mux_client_hello_exchange")
+
+
+def ssh_mux_opts(env=None):
+    env = os.environ if env is None else env
+    if (env.get("PODCTL_SSH_MUX") or "").strip() == "0":
+        return []
+    d = (env.get("PODCTL_SSH_MUX_DIR") or "").strip() or str(pathlib.Path.home() / ".cache" / "podctl" / "ssh")
+    if len(d) + len("/%C") + 38 > 103:
+        return []
+    return ["-o", "ControlMaster=auto", "-o", "ControlPath=%s/%%C" % d, "-o", "ControlPersist=%d" % SSH_MUX_PERSIST,
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]   # a stopped pod's master dies within a minute
+
+
+SSH_CMD = ["ssh", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=accept-new"] + ssh_mux_opts()
+SCP_CMD = ["scp", "-q", "-o", "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=accept-new"] + ssh_mux_opts()
 TUNNEL_PORTS = [8188, 8888]      # ComfyUI, JupyterLab
+
+
+def _mux_ready():
+    """The ControlPath's folder (mode 700) before an ssh that may become the master; nothing when multiplexing is off."""
+    for a in SSH_CMD:
+        if a.startswith("ControlPath="):
+            d = pathlib.Path(a[len("ControlPath="):]).parent
+            try:
+                d.mkdir(parents=True, exist_ok=True); os.chmod(d, 0o700)
+            except OSError:
+                pass                     # ssh then says it cannot bind and runs the command unmultiplexed
+            return
+
+
+def mux_close(env=None):
+    """Close this alias's master now (`ssh -O exit`), best effort: before a stop or restart, so no command waits on a
+    master whose machine went away."""
+    import subprocess
+    if not any(a.startswith("ControlPath=") for a in SSH_CMD):
+        return
+    try:
+        subprocess.run(SSH_CMD + ["-O", "exit", SSH_ALIAS], capture_output=True, text=True, env=env or os.environ, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def mux_warm(env=None):
+    """Open the master in the background (a thread running `true`) so its handshake overlaps the provider's API read;
+    join it before the first real command. A no-op thread when multiplexing is off."""
+    import threading
+    def _open():
+        try:
+            ssh_run("true", env=env, timeout=30)
+        except Exception:                                    # pragma: no cover - the real command says what is wrong
+            pass
+    t = threading.Thread(target=_open if any(a.startswith("ControlPath=") for a in SSH_CMD) else (lambda: None), daemon=True)
+    t.start()
+    return t
 
 
 def tunnel_port(v):
@@ -297,10 +421,19 @@ def ssh_run(remote_cmd, env=None, timeout=None, input=None):
     `input` is fed to the remote command's stdin. That is the only way to hand a machine a SECRET: a value in
     remote_cmd becomes argv, and sshd runs a non-login command as `bash -c '<cmd>'`, so it lands in the remote
     /proc/<pid>/cmdline, which is world-readable on Linux, as well as in ps on this Mac. lib/boot.sh says the
-    same thing about JUPYTER_TOKEN: it rides the environment, never argv."""
+    same thing about JUPYTER_TOKEN: it rides the environment, never argv.
+
+    3.24.0: a master whose machine went away (stopped or restarted within SSH_MUX_PERSIST) fails the session request
+    before the command starts; that one case closes the master and runs the command once more on a fresh connection.
+    A failure after the command started is never retried: the command may have run."""
     import subprocess
-    return subprocess.run(SSH_CMD + [SSH_ALIAS, remote_cmd], capture_output=True, text=True,
-                          env=env or os.environ, timeout=timeout, input=input)
+    _mux_ready()
+    argv = SSH_CMD + [SSH_ALIAS, remote_cmd]
+    r = subprocess.run(argv, capture_output=True, text=True, env=env or os.environ, timeout=timeout, input=input)
+    if r.returncode == 255 and SSH_MUX_STALE.search(r.stderr or ""):
+        mux_close(env)
+        r = subprocess.run(argv, capture_output=True, text=True, env=env or os.environ, timeout=timeout, input=input)
+    return r
 
 
 def tunnel_argv(ports=None, host=None, port=None, key=None, user=None):
@@ -322,8 +455,28 @@ def tunnel_argv(ports=None, host=None, port=None, key=None, user=None):
     return argv + ["-p", str(int(port)), "%s@%s" % (user or SSH_USER, host)]
 
 
+def _sums_cmd(to, names, mkdir=False):
+    """The shell that prints 'size sha256  path' for each of `names` that exists under `to` (mkdir=True makes `to` first)."""
+    return "%scd %s && for f in %s; do [ -f \"$f\" ] && printf '%%s %%s  %%s\\n' \"$(stat -c %%s \"$f\")\" \"$(sha256sum \"$f\" | cut -d' ' -f1)\" \"$PWD/$f\"; done; true" % (
+        ("mkdir -p %s && " % _sq(to)) if mkdir else "", _sq(to), " ".join(_sq(n) for n in names))
+
+
+def _parse_sums(text):
+    sums = {}
+    for line in (text or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            sums[pathlib.Path(parts[2].strip()).name] = (int(parts[0]), parts[1])
+    return sums
+
+
 def upload(files, to, env=None):
-    """scp each file to <to>/ through the run's Host block, then compare size and sha256 on both sides. A mismatch fails."""
+    """Put files in <to>/ through the run's Host block, then compare size and sha256 on both sides. A mismatch fails.
+
+    3.24.0: three round trips for any number of files, and no bytes at all for a file the machine already has: one probe
+    (mkdir, then the size and sha256 of each file of that name already there), ONE scp for the files that differ, one
+    check of what was sent. A file whose size and sha256 already match is the same file, proven the same way the check
+    after a send proves it, so it is not sent again (a retry, a second install of an unchanged zip, a buyer's base zip)."""
     import hashlib
     import subprocess
     env = env or os.environ
@@ -331,29 +484,28 @@ def upload(files, to, env=None):
     for f in files:
         if not f.exists():
             raise PodctlError("no such file: %s" % f)
-    r = ssh_run("mkdir -p %s" % _sq(to), env=env)
+    local = {f.name: (f.stat().st_size, hashlib.sha256(f.read_bytes()).hexdigest()) for f in files}
+    r = ssh_run(_sums_cmd(to, local, mkdir=True), env=env)
     if r.returncode != 0:
         raise PodctlError("ssh %s mkdir failed: %s" % (SSH_ALIAS, r.stderr.strip()[-300:]))
-    r = subprocess.run(SCP_CMD + [str(f) for f in files] + ["%s:%s/" % (SSH_ALIAS, to)], capture_output=True, text=True, env=env)
-    if r.returncode != 0:
-        raise PodctlError("scp failed: %s" % r.stderr.strip()[-300:])
-    remote_cmd = "cd %s && for f in %s; do printf '%%s %%s  %%s\\n' \"$(stat -c %%s \"$f\")\" \"$(sha256sum \"$f\" | cut -d' ' -f1)\" \"$PWD/$f\"; done" % (
-        _sq(to), " ".join(_sq(f.name) for f in files))
-    r = ssh_run(remote_cmd, env=env)
-    if r.returncode != 0:
-        raise PodctlError("ssh %s sha256 failed: %s" % (SSH_ALIAS, r.stderr.strip()[-300:]))
-    remote = {}
-    for line in r.stdout.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) == 3:
-            remote[pathlib.Path(parts[2].strip()).name] = (int(parts[0]), parts[1])
+    remote = _parse_sums(r.stdout)
+    send = [f for f in files if remote.get(f.name) != local[f.name]]
+    if send:
+        _mux_ready()
+        r = subprocess.run(SCP_CMD + [str(f) for f in send] + ["%s:%s/" % (SSH_ALIAS, to)], capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            raise PodctlError("scp failed: %s" % r.stderr.strip()[-300:])
+        r = ssh_run(_sums_cmd(to, [f.name for f in send]), env=env)
+        if r.returncode != 0:
+            raise PodctlError("ssh %s sha256 failed: %s" % (SSH_ALIAS, r.stderr.strip()[-300:]))
+        remote.update(_parse_sums(r.stdout))
     lines = []
     for f in files:
-        size, digest = f.stat().st_size, hashlib.sha256(f.read_bytes()).hexdigest()
+        size, digest = local[f.name]
         got = remote.get(f.name)
         if got != (size, digest):
             raise PodctlError("%s: size/sha256 differ after upload (local %d %s, remote %s)" % (f.name, size, digest[:12], got))
-        lines.append("ok  %10d  %s  %s/%s" % (size, digest[:12], to, f.name))
+        lines.append("ok  %10d  %s  %s/%s%s" % (size, digest[:12], to, f.name, "" if f in send else "  (already there: not sent)"))
     return "\n".join(lines)
 
 
@@ -618,12 +770,22 @@ def gpu_verdict_many(cards, apps):
     return tuple(sums) + ("NOT-OURS" if bad else "ours",)
 
 
-def gpu_probe(io):
+GPU_FIT_QUERY = "nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader,nounits 2>/dev/null"
+GPU_FIT_MARK = "---podctl-gpu-fit---"
+
+
+def gpu_probe(io, fit=False):
     """(line, verdict) from the pod: 'verdict=no-gpu' when nvidia-smi does not answer (a GPU-less pod, or the stand-in).
-    3.20.0: every card of a multi-GPU pod, each judged by its own processes (gpu_verdict_many)."""
+    3.20.0: every card of a multi-GPU pod, each judged by its own processes (gpu_verdict_many).
+    3.28.0 `fit`: gpu_fit_note's question (GPU_FIT_QUERY) rides in the same round trip; its answer is kept on `io` for it."""
     rc, out, err = io.remote("nvidia-smi --query-gpu=memory.total,memory.used,uuid --format=csv,noheader,nounits 2>/dev/null; echo ---; "
-                             "nvidia-smi --query-compute-apps=pid,used_memory,gpu_uuid --format=csv,noheader,nounits 2>/dev/null")
-    head, _, tail = (out or "").partition("---")
+                             "nvidia-smi --query-compute-apps=pid,used_memory,gpu_uuid --format=csv,noheader,nounits 2>/dev/null"
+                             + ("; echo %s; %s" % (GPU_FIT_MARK, GPU_FIT_QUERY) if fit else ""))
+    out = out or ""
+    if fit:
+        out, _, answer = out.partition(GPU_FIT_MARK)
+        io.gpu_fit_answer = answer.strip()
+    head, _, tail = out.partition("---")
     cards = []
     for line in head.strip().splitlines():
         nums = [x.strip() for x in line.split(",")]
@@ -641,9 +803,10 @@ def gpu_probe(io):
     return "total=%d used=%d ours=%d foreign=%d procs=%d%s verdict=%s" % (total, used, ours, foreign, len(apps), many, v), v
 
 
-def gpu_gate(io, say, uploading=True):
-    """Print the verdict; True when the run may proceed. `uploading`: the caller was about to upload (install)."""
-    line, v = gpu_probe(io)
+def gpu_gate(io, say, uploading=True, fit=False):
+    """Print the verdict; True when the run may proceed. `uploading`: the caller was about to upload (install). `fit`
+    (3.28.0): gpu_fit_note's question asked in the same round trip (gpu_probe)."""
+    line, v = gpu_probe(io, fit=fit)
     if v == "ours":
         say("gpu     %s — the GPU is ours" % line); return True
     if v == "no-gpu":
@@ -667,15 +830,25 @@ def gpu_prefer_of(script_path):
     return _gpu_fit.parse_prefer(m.group(1)) if m else []
 
 
+def gpu_wants(items):
+    """[(package name, its GPU_PREFER classes)] for every package that declares some."""
+    wants = [(it["name"], gpu_prefer_of(it["local_script"])) for it in items if it.get("kind") == "pkg" and it.get("local_script")]
+    return [(n, p) for n, p in wants if p]
+
+
 def gpu_fit_note(io, items, say):
     """Before the upload, the pod's GPU against every package's GPU_PREFER: a GPU below what a package is tuned for is a
     WARNING with what it lacks, never a stop (the run is the person's call). Asked over ssh, the same three numbers the
-    pod's own run reads (py/gpu_fit.py), so the Mac and the pod never disagree."""
-    wants = [(it["name"], gpu_prefer_of(it["local_script"])) for it in items if it.get("kind") == "pkg" and it.get("local_script")]
-    wants = [(n, p) for n, p in wants if p]
+    pod's own run reads (py/gpu_fit.py), so the Mac and the pod never disagree. 3.28.0: the answer gpu_probe already
+    brought back (gpu_gate(..., fit=True)) is used as it is, with no round trip of its own."""
+    wants = gpu_wants(items)
     if not wants:
         return
-    rc, out, _ = io.remote("nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader,nounits 2>/dev/null")
+    answer = getattr(io, "gpu_fit_answer", None)
+    if answer is not None:
+        rc, out = (0, answer) if answer else (1, "")
+    else:
+        rc, out, _ = io.remote(GPU_FIT_QUERY)
     parts = [x.strip() for x in (out or "").strip().splitlines()[0].split(",")] if rc == 0 and (out or "").strip() else []
     if len(parts) < 3 or not parts[2].isdigit():
         say("gpu fit no nvidia-smi answer on the pod: %s not verified" % "; ".join("%s wants %s" % (n, _gpu_fit.want_text(p)) for n, p in wants))
@@ -818,9 +991,11 @@ class PodIO:
         return pathlib.Path(root) / h.hexdigest()
 
     def upload(self, files, to):
-        line = self.provider.record_volume(self.pod, env=self.env)
-        if line:
-            self.say(line)
+        if not getattr(self, "_volume_recorded", False):     # 3.24.0: once per run (an API read and an ssh each time before)
+            line = self.provider.record_volume(self.pod, env=self.env)
+            if line:
+                self.say(line)
+            self._volume_recorded = True
         self.say(upload(files, to, env=self.env))
     def remote(self, cmd):
         r = ssh_run(cmd, env=self.env)
@@ -843,6 +1018,7 @@ class PodIO:
         import subprocess
         local_dir = pathlib.Path(local_dir); local_dir.mkdir(parents=True, exist_ok=True)
         pick = ("--newer %s " % _sq(newer_than)) if newer_than else ""
+        _mux_ready()
         with subprocess.Popen(SSH_CMD + [SSH_ALIAS, "tar -C %s %s-czf - ." % (_sq(remote_dir), pick)],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env) as src:
             dst = subprocess.run(["tar", "-xzf", "-", "-C", str(local_dir)], stdin=src.stdout, capture_output=True, env=self.env)
@@ -918,8 +1094,13 @@ def _run_logged(io, name, slug, inner, every=30, timeout=3 * 3600):
         io.say("STOP: could not start %s on the pod (exit %d)\n%s" % (name, rc, _tail(out + err))); return None, "", console
     io.say("  running: %s\n  console: %s" % (inner, console))
     waited, last_hdr, text = 0, "", ""
+    # 3.24.0: the wait happens ON THE MACHINE. Each poll looks for STEP RC once a second there, for up to `every` seconds,
+    # then returns the console: the end of a step is seen within a second, where a sleep here between polls saw it
+    # every/2 seconds late on average and each poll paid a connection of its own on top.
+    poll = ('f=%s; i=0; while [ "$i" -lt %d ] && ! grep -q "^STEP RC=" "$f" 2>/dev/null; do sleep 1; i=$((i+1)); done; cat "$f" 2>/dev/null'
+            % (_sq(console), max(1, int(every))))
     while True:
-        rc, out, err = io.remote("cat %s 2>/dev/null" % _sq(console))
+        rc, out, err = io.remote(poll)
         text = out
         m = STEP_RC.search(text)
         if m:
@@ -929,7 +1110,9 @@ def _run_logged(io, name, slug, inner, every=30, timeout=3 * 3600):
             last_hdr = hdrs[-1]; io.say("  %s" % last_hdr[:110])
         if waited >= timeout:
             io.say("STOP: %s did not finish within %d s — the run is still going on the pod; console: %s" % (name, timeout, console)); return None, text, console
-        io.sleep(every); waited += every
+        if rc == 255:
+            io.sleep(every)          # ssh itself failed, so nothing waited on the machine: wait here, never spin
+        waited += max(1, int(every))
 
 
 def _preflight(io, env, script):
@@ -990,18 +1173,23 @@ def install(pod_id, dirs, io, every=5, timeout=3 * 3600, latest=True, save_pins_
             return 1
         if not it["zip"].exists():
             io.say("STOP: %s has no zip (%s) — build it first" % (it["name"], it["zip"].name)); return 1
-    if not gpu_gate(io, io.say):
+    if not gpu_gate(io, io.say, fit=bool(gpu_wants(items))):     # 3.28.0: one round trip for both questions
         return 1
     gpu_fit_note(io, items, io.say)
+    # 3.24.0: every zip is checked (and gated) first, then all of them go up in ONE upload: three round trips in all, not
+    # three per item, and a zip already on the machine with the same size and sha256 is not sent again. A stale package
+    # zip now stops the install before the base has changed anything on the machine.
+    zips = []
     for it in items:
-        io.say("══ %s ══" % it["name"])
         try:
-            z = it["zip"] if it.get("buyer") else io.check_zip(it["dir"])
+            zips.append(it["zip"] if it.get("buyer") else io.check_zip(it["dir"]))
             if not it.get("buyer") and not getattr(args_no_gate, "value", False) and hasattr(io, "gate"):
                 io.gate(it["dir"], io.say)
         except PodctlError as e:
             io.say("STOP: %s" % e); return 1
-        io.upload([z], pkgs_dir())
+    io.upload(zips, pkgs_dir())
+    for it, z in zip(items, zips):
+        io.say("══ %s ══" % it["name"])
         if it["kind"] == "base":
             rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && python3 -m zipfile -e %s ." % _sq(z.name))
         else:
@@ -1295,6 +1483,7 @@ def cmd_runner(prov, args):
 
 def cmd_stop(prov, args):
     runner_off(args.pod)
+    mux_close()
     print(prov.stop(args.pod, wait=args.wait))
 
 
@@ -1312,6 +1501,7 @@ def cmd_deploy(prov, args):
 
 
 def cmd_restart(prov, args):
+    mux_close()
     print(prov.restart(args.pod, wait=args.wait, ssh_config=args.ssh_config))
     if args.wait:
         print(gpu_line_over_ssh())
@@ -1487,13 +1677,30 @@ def lease_take(holder, purpose, minutes, timeout=30):
     return lease_parse(line)
 
 
+def lease_take_with(holder, purpose, minutes, also, timeout=30):
+    """3.28.0: lease_take and one more write in the SAME round trip: (the lease, whether `also` exited 0). The lease is
+    judged exactly as lease_take judges it (its own exit status, a PodctlError when it could not be written); `also` runs
+    whatever the lease did, and a caller whose `also` failed runs it again on its own, where its own error is said."""
+    import shlex
+    line = lease_encode(holder, purpose, minutes)
+    lease = "mkdir -p %s && printf '%%s\\n' %s > %s" % (
+        shlex.quote(os.path.dirname(LEASE_PATH)), shlex.quote(line), shlex.quote(LEASE_PATH))
+    r = ssh_run("{ %s; }; lrc=$?; { %s; } >/dev/null 2>&1; echo \"podctl-also=$?\"; exit $lrc" % (lease, also), timeout=timeout)
+    if r.returncode != 0:
+        raise PodctlError("could not write the lease: %s" % (r.stderr or r.stdout).strip()[:200])
+    return lease_parse(line), "podctl-also=0" in (r.stdout or "")
+
+
 def lease_release(holder, timeout=30):
-    """Drop the lease if it is ours (or already gone). Never removes someone else's."""
-    cur = lease_read(timeout=timeout)
-    if cur and cur.get("holder") != holder:
-        return False
-    ssh_run("rm -f %s" % LEASE_PATH, timeout=timeout)
-    return True
+    """Drop the lease if it is ours (or already gone). Never removes someone else's.
+    3.24.0: one round trip, not a read and then a remove: the machine removes the file when it is empty, holds no holder
+    at all (unreadable, which lease_parse reads as free), or names this holder exactly as lease_encode writes it
+    (`"holder": <json>`; a holder inside another field is escaped there, so it cannot match)."""
+    import json as _json, shlex
+    mine = '"holder": %s' % _json.dumps(holder)
+    r = ssh_run('f=%s; if [ ! -s "$f" ] || grep -qF -- %s "$f" || ! grep -q \'"holder"\' "$f"; then rm -f "$f"; echo released; '
+                'else echo kept; fi' % (shlex.quote(LEASE_PATH), shlex.quote(mine)), timeout=timeout)
+    return "kept" not in (r.stdout or "")
 
 
 def cmd_pins(api, args):
@@ -1653,24 +1860,29 @@ def cmd_install(prov, args):
         dirs.append(resolve_pkg_dir(root, d))
     if not dirs:
         raise PodctlError("nothing to install: --base and/or --pkg <dir>")
+    warm = mux_warm()                    # 3.24.0: the one ssh connection opens while the provider's API answers
     pod = prov.pod(args.pod)
+    warm.join()
     # The lease before the upload: an install restarts ComfyUI, which kills whatever another session is
     # rendering or training. Advisory and expiring — see the lease block above.
     args_no_gate.value = bool(getattr(args, "no_gate", False))
     me = lease_me()
-    blocked, why = lease_blocks(lease_read(), me)
+    cur = lease_read()                   # 3.24.0: read once (it was read twice, a round trip each)
+    blocked, why = lease_blocks(cur, me)
     if blocked and not getattr(args, "force_lease", False):
         print("STOP: %s\n      wait for it, message that session, or pass --force-lease" % why)
         return 3
     minutes = max(20, int(args.timeout / 60) * len(dirs) // 4 or 20)
-    minutes = lease_minutes_keeping(lease_read(), me, minutes)      # an install inside a longer chain keeps the chain's window
-    try:
-        got = lease_take(me, "install: " + ", ".join(d.name for d in dirs), minutes)
+    minutes = lease_minutes_keeping(cur, me, minutes)      # an install inside a longer chain keeps the chain's window
+    host_cmd, host_line = host_env_write(prov)
+    try:                                 # 3.28.0: the lease and state/host.env in one round trip (lease_take_with)
+        got, host_ok = lease_take_with(me, "install: " + ", ".join(d.name for d in dirs), minutes, host_cmd)
         print("lease   held by %s until %s" % (got["holder"], got["expires"]))
     except PodctlError as e:
         print("lease   could not be taken (%s) — continuing; it is advisory" % e)
+        host_ok = False
     try:
-        print(write_host_env(prov))
+        print(host_line if host_ok else write_host_env(prov))      # its own round trip only when the shared one did not write it
         if getattr(args, "comfy_ref", None):
             print("comfyui ref %s (from --comfy-ref; this install only: the next one without it returns the store to the newest release)" % args.comfy_ref)
         run_env = install_run_env(args, pod)
@@ -1717,16 +1929,21 @@ def parse_link_fact(text):
     return _last_line(head.partition("--link--")[2])
 
 
-def tunnel_plan(ports, given, machine_apps, declared, token, names=None):
+def tunnel_plan(ports, given, machine_apps, declared, token, names=None, env=None):
     """The ports to forward and the named localhost links to print: [ports], [lines].
     Without --port: ComfyUI, JupyterLab and every app port the machine serves (else the ones this tree declares).
-    With --port: exactly those. A forwarded port is named by the base, then the machine's apps, then this tree's."""
+    With --port: exactly those. A forwarded port is named by the base, then the machine's apps, then this tree's.
+    3.23.0: a plain port comes back as LOCAL:REMOTE when its local side is not its own number (tunnel_local_ports:
+    the offset, or a slot in $PODCTL_TUNNEL_BASE's block). Before, the tunnel bound 8188 and 8888 whatever the
+    offset said, while ssh-config, jupyter and mcp printed the offset ports. LOCAL:REMOTE as typed is kept."""
     apps = list(machine_apps or []) or [(a[0], a[1], a[2]) for a in (declared or [])]
     ports = list(ports or TUNNEL_PORTS)
     if not given:
         for a in apps:
             if int(a[0]) not in [int(str(p).rpartition(":")[2]) for p in ports]:
                 ports.append(int(a[0]))
+    local = tunnel_local_ports([p for p in ports if ":" not in str(p)], env)
+    ports = [p if ":" in str(p) or local[int(p)] == int(p) else "%d:%d" % (local[int(p)], int(p)) for p in ports]
     named = dict(names or BASE_PORT_NAMES)
     for a in reversed(list(declared or [])):
         named.setdefault(int(a[0]), a[2])
@@ -1785,7 +2002,7 @@ def cmd_tunnel(prov, args):
 #           run tools work; the ones that need the tree do not, because the tree is on the other machine.
 #
 # ssh is the default because the smaller set is rarely what anyone wanted. ClearAllForwardings is not
-# optional: the Host block ssh-config writes carries four LocalForward lines, and a second session binding
+# optional: the Host block ssh-config writes carries the LocalForward lines, and a second session binding
 # them while `podctl tunnel` holds them prints warnings onto the stdio channel MCP is trying to speak.
 MCP_ENV = {"DO_NOT_TRACK": "1", "COMFY_NO_TELEMETRY": "1"}   # comfy-cli ships mixpanel and posthog; rule 9 says nothing is uploaded
 MCP_VENV_DIRNAME = ".venv-cu130"
@@ -2195,10 +2412,13 @@ def cmd_create(prov, args):
         raise PodctlError("--gpu is required on host %s (it has no default GPU order)" % getattr(prov, "name", "?"))
     seen = []
     takes_volume = "volume" in inspect.signature(prov.availability).parameters
+    # 3.29.0: a host whose stock check takes the image and --min-cuda asks only hosts at create's CUDA floor (RunPod)
+    floor_kw = ({k: v for k, v in (("image", getattr(args, "image", None)), ("min_cuda", getattr(args, "min_cuda", None))) if v}
+                if "image" in inspect.signature(prov.availability).parameters else {})
     for gpu in gpus:
         # 3.10.1: only data centres the pod can be created in, and with a network volume only those that take one;
         # 3.18.0: a fresh pod makes none (and a reusable volume's data centre takes them), so then every one counts
-        many = {"count": n} if n > 1 else {}
+        many = dict({"count": n} if n > 1 else {}, **floor_kw)
         locs = (prov.availability(gpu, spot=args.spot, volume=not private and not can_fresh, **many) if takes_volume
                 else prov.availability(gpu, spot=args.spot, **many))
         print("stock   %s%s%s free now in: %s" % (("%d x " % n) if n > 1 else "", gpu, spot, ", ".join(locs) if locs else "no location"))
@@ -2255,7 +2475,7 @@ def cmd_create(prov, args):
     pod_id = prov.create_machine(args.name, args.gpu, loc, args.data_gb, os_gb=args.os_gb, pubkey=pub, spot=args.spot,
                                  wait=not args.no_wait, ssh_config=args.ssh_config, **extra)
     print("next: podctl ensure %s · podctl install %s --base --pkg <dir> (or buyer-install with --runtime and the zips)%s" % (
-        pod_id, pod_id, (" · podctl tunnel %s, then ComfyUI is http://localhost:8188" % pod_id) if private else ""))
+        pod_id, pod_id, (" · podctl tunnel %s, then ComfyUI is http://localhost:%d" % (pod_id, tunnel_locals()["comfy"])) if private else ""))
 
 
 def cmd_pause(prov, args):
@@ -2325,7 +2545,7 @@ def build_parser():
     p = sub.add_parser("install", help="the whole documented sequence, one command: upload, extract, preflight, run (everything to its newest), poll, copy logs, save the pack records")
     p.add_argument("pod"); p.add_argument("--base", action="store_true", help="ComfyUI Base as step one")
     p.add_argument("--pkg", action="append", help="a package directory (repeatable, in order); relative to the project folder")
-    p.add_argument("--every", type=int, default=5, help="poll interval in seconds (3.2.0: 5; a 30 s poll cost 15 s of dead time per step on average)"); p.add_argument("--timeout", type=int, default=3 * 3600, help="per item, seconds")
+    p.add_argument("--every", type=int, default=5, help="seconds each poll may wait ON THE MACHINE for the step to end (3.24.0: the end is seen within a second either way)"); p.add_argument("--timeout", type=int, default=3 * 3600, help="per item, seconds")
     p.add_argument("--no-latest", dest="no_latest", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--comfy-ref", metavar="REF", help="ComfyUI at a ref NEWER than the newest release (master, a branch, a newer tag, a full sha), for this install only")
     p.add_argument("--no-save-pins", dest="save_pins", action="store_false", help="do not write the printed pins back after a green run")
@@ -2356,8 +2576,8 @@ def build_parser():
     p = sub.add_parser("tunnel", help="the ONE ssh session that forwards ports (ComfyUI 8188, Jupyter Terminal 8888, each app port the "
                                       "machine serves) and prints them as named localhost links; runs until killed")
     p.add_argument("pod"); p.add_argument("--port", type=tunnel_port, action=_FreshAppend, default=list(TUNNEL_PORTS),
-                   help="repeatable; default 8188, 8888 and the machine's app ports. LOCAL:REMOTE shifts the local side, e.g. --port 8190:8188 "
-                        "reaches a second machine's ComfyUI on 8190 while the first keeps 8188")
+                   help="repeatable; default 8188, 8888 and the machine's app ports, each REMOTE port bound locally at its offset or its "
+                        "slot under $PODCTL_TUNNEL_BASE. LOCAL:REMOTE picks the local side by hand, e.g. --port 8190:8188")
     p = sub.add_parser("mcp", help="write the .mcp.json that points an MCP client at this machine's ComfyUI (Comfy MCP)")
     p.add_argument("pod")
     p.add_argument("--over", choices=("ssh", "tunnel"), default="ssh",

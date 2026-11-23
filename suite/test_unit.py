@@ -75,6 +75,18 @@ def test_unit_version_file_is_semver_and_base_prints_it():
     assert "\n- %s:" % v in hb, "the handbook's Record section has no '- %s:' entry" % v
 
 
+def test_unit_the_os_stage_installs_the_gl_libraries_mediapipe_links():
+    """3.29.1: MediaPipe's libmediapipe.so links libEGL.so.1 and libGLESv2.so.2 even on CPU (OSError: libEGL.so.1). On Ubuntu
+    24.04 those are libegl1 and libgles2; the OS stage's own package list and the Verda startup's must both carry them."""
+    sysh = (BASE / "lib" / "15-system.sh").read_text()
+    want = re.search(r"_base_apt_core\(\)\{[^\n]*\n(?:[^\n]*\n)*?\s*echo \"([^\"]*)\"", sysh)      # 3.30.2: the one list the OS stage and runtime-capture read
+    assert want and {"libegl1", "libgles2"} <= set(want.group(1).split()), want and want.group(1)
+    assert "read -r -a want <<< \"$(_base_apt_core)\"" in sysh
+    startup = (BASE / "hosts" / "verda" / "startup.sh").read_text()
+    need = re.search(r"local need=\(([^)]*)\)", startup)
+    assert need and {"libegl1", "libgles2"} <= set(need.group(1).split()), need and need.group(1)
+
+
 def test_unit_sourcing_defines_the_contract_helpers():
     probe = ('for f in ok miss err note hdr would todo warn base_mkdir base_run _base_confirm _base_confirm_yes '
              '_base_on_err _base_on_exit _base_install_traps base_env_setup _base_vge _base_fs_is_pool _base_sha256 '
@@ -141,7 +153,7 @@ def test_unit_no_and_list_ends_a_loop_body():
 
 
 def test_unit_outbound_hosts_are_allowlisted():
-    allow = {"huggingface.co", "github.com", "pypi.org", "pypi.nvidia.com", "download.pytorch.org",
+    allow = {"huggingface.co", "github.com", "civitai.com", "pypi.org", "pypi.nvidia.com", "download.pytorch.org",
              "developer.download.nvidia.com", "127.0.0.1", "localhost", "0.0.0.0"}   # 3.0.0: NVIDIA's CUDA repository (the driver)
     src = "\n".join(_src(p) for p in [*LIB, *sorted((BASE / "py").glob("*.py"))])
     hosts = set(re.findall(r"https?://([A-Za-z0-9.-]+)", src))
@@ -255,6 +267,32 @@ def test_unit_gpu_fit_names_b200_and_b300_and_judges_every_other_gpu_below(tmp_p
     assert r.stdout.rstrip("\n").split("\t")[4] == "want=B200 (sm_100, 180 GB) or B300 (sm_103, 288 GB)", r.stdout
     r = subprocess.run([sys.executable, str(BASE / "py" / "gpu_fit.py"), "--check", "B200 H9000"], capture_output=True, text=True)
     assert r.returncode == 1 and "H9000" in r.stdout
+
+
+def test_unit_gpu_fit_knows_the_rtx_pro_6000_server_edition_and_the_gb300(tmp_path):
+    """3.28.0: two more classes, warnings only (GPU_PREFER never stops a run). NVIDIA's CUDA GPU table: the RTX PRO 6000
+    Blackwell Server Edition is 12.0 (96 GB GDDR7; nvidia-smi reads 97887 MiB), the GB300 10.3 (288 GB HBM3e, on a Grace
+    aarch64 host). sm_120 is also an RTX 5090's (32 GB), so an architecture fits only with that class's memory too: a
+    5090 is below "RTX-PRO-6000", as a 34 GB MIG slice of a B300 is below "B300". A GB300's name is never a B300's."""
+    sys.path.insert(0, str(BASE / "py")); import gpu_fit
+    assert gpu_fit.unknown_classes(["B200", "B300", "GB300", "RTX-PRO-6000"]) == []
+    assert gpu_fit.fits(["RTX-PRO-6000"], "12.0", 97887) == "ok"
+    assert gpu_fit.fits(["RTX-PRO-6000"], "12.0", 32607) == "below"              # an RTX 5090: the same sm, a third of it
+    assert gpu_fit.fits(["GB300"], "10.3", 284000) == "ok" and gpu_fit.fits(["B200", "B300"], "10.3", 284000) == "ok"
+    assert gpu_fit.fits(["B200", "B300"], "10.3", 34816) == "below"              # a MIG slice by its numbers, as by its name
+    assert gpu_fit.fits(["B200", "B300"], "12.0", 97887) == "below"              # the RTX PRO 6000 under the video packages
+    assert gpu_fit.class_of_name("NVIDIA GB300") == "GB300" and gpu_fit.class_of_name("NVIDIA B300 SXM6 AC") == "B300"
+    assert gpu_fit.class_of_name("NVIDIA RTX PRO 6000 Blackwell Server Edition") == "RTX-PRO-6000"
+    assert gpu_fit.class_of_name("NVIDIA RTX PRO 6000 Blackwell Workstation Edition") == "RTX-PRO-6000"   # the same chip and memory
+    assert gpu_fit.class_of_name("NVIDIA RTX 6000 Ada Generation") is None       # Ada's card has no "PRO"
+    assert gpu_fit.fits(["RTX-PRO-6000"], None, None, "NVIDIA RTX PRO 6000 Blackwell Server Edition") == "ok"
+    assert gpu_fit.want_text(["GB300", "RTX-PRO-6000"]) == "GB300 (sm_103, 288 GB) or RTX-PRO-6000 (sm_120, 96 GB)"
+    assert gpu_fit.pick_lane(69, 60, "RTX-PRO-6000").gpu == "NVIDIA RTX PRO 6000"   # half a card (ZeroGPU large) is not one
+    r = subprocess.run([sys.executable, str(BASE / "py" / "gpu_fit.py"), "--check", "B200 B300 GB300 RTX-PRO-6000"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout
+    # the run's own banner: a warning, never a stop
+    r = _bash('GPU_PREFER="B200 B300"; PKG_NAME=P; BASE_FAKE_GPU="NVIDIA RTX PRO 6000 Blackwell Server Edition|12.0|97887"; _base_gpu_fit; echo "RC=$?"')
+    assert "RC=0" in r.stdout and "is below what P is tuned for" in r.stdout + r.stderr, r.stdout + r.stderr
 
 
 def test_unit_pick_lane_takes_the_cheapest_lane_that_holds_the_peak_and_the_run(tmp_path):
@@ -1312,6 +1350,9 @@ EOF
     exit 0;;
   "pip compile") cat >/dev/null; v=""; prev=""
     for a in "$@"; do [ "$prev" = "--python-version" ] && v="$a"; prev="$a"; done
+    for a in "$@"; do case "$a" in */requirements.txt)                  # $REQ_BAD: "<minor>:<folder>" pairs that need a build
+      pkg="$(basename "$(dirname "$a")")"
+      for bad in ${REQ_BAD:-}; do [ "$bad" = "$v:$pkg" ] && { echo "no wheels for $pkg on $v" >&2; exit 1; }; done; exit 0;; esac; done
     for ok in $TORCH_OK; do [ "$ok" = "$v" ] && exit 0; done
     echo "No solution found when resolving dependencies: torch" >&2; exit 1;;
   "venv --python") d="$4"
@@ -1350,6 +1391,26 @@ def test_unit_testbed_picks_the_newest_python_torch_ships_for(tmp_path):
     tb, log, run = _testbed_sandbox(tmp_path / "later", "3.15 3.14")
     r = run("_testbed_python_pick")
     assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "3.15", r.stdout + r.stderr
+
+
+def test_unit_testbed_pick_prefers_the_minor_where_more_requirement_files_install_from_wheels(tmp_path):
+    """3.30.5 (issue #71): torch had cp315 wheels but onnxruntime and kornia-rs had none, so on 3.15 ComfyUI's own install
+    and Easy-Use failed and their nodes never registered. With ComfyUI and packs on disk the pick counts the requirement
+    files each torch-ready minor installs from wheels alone (--no-build): the most wins, the newer on a tie."""
+    _repo_only("the repo's testbed.sh")
+    tb, log, run = _testbed_sandbox(tmp_path, "3.15 3.14 3.13")
+    for d in ("testbed", "testbed/custom_nodes/Easy-Use", "testbed/custom_nodes/KJNodes"):
+        (tb / d).mkdir(parents=True, exist_ok=True); (tb / d / "requirements.txt").write_text("x\n")
+    packs = 'PACKS=("Easy-Use|u||" "KJNodes|u||"); '
+    r = run(packs + "REQ_BAD='3.15:testbed 3.15:Easy-Use' _testbed_python_pick")
+    assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "3.14", r.stdout + r.stderr
+    assert "Python 3.15: 1 of 3 requirement files install from wheels" in r.stderr, r.stderr
+    assert "Python 3.14: 3 of 3" in r.stderr, r.stderr
+    assert all("--no-build" in ln for ln in log.read_text().splitlines() if "requirements.txt" in ln)
+    r = run(packs + "REQ_BAD='' _testbed_python_pick")                     # a tie: the newest
+    assert r.stdout.strip().splitlines()[-1] == "3.15", r.stdout + r.stderr
+    r = run(packs + "REQ_BAD='3.15:KJNodes 3.14:KJNodes 3.13:KJNodes' _testbed_python_pick")   # fails everywhere: never decides
+    assert r.stdout.strip().splitlines()[-1] == "3.15", r.stdout + r.stderr
 
 
 def test_unit_testbed_pick_keeps_a_working_venv_when_nothing_resolves(tmp_path):
@@ -1679,6 +1740,57 @@ def test_unit_sage_wheels_are_built_and_named_the_way_a_pod_keys_them(tmp_path):
     (src / "setup.py").write_text('    NVCC_FLAGS = ["-std=c++17"]\n        elif capability.startswith("10.0"):\n            HAS_SM100 = True\n            num = "100a"\n')
     r = _bash(f'_base_sage_prepare_src "{src}"; cat "{src}/setup.py"')
     assert "-std=c++20" in r.stdout and "c++17" not in r.stdout and 'startswith("10.3")' in r.stdout and 'num = "103a"' in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_sage_publish_skips_a_wheel_published_with_its_sum_and_a_dry_run_only_warns(tmp_path):
+    """3.22.1: a pull request rebuilds every arch and the release usually holds them all, so its dry publish failed on the
+    first one (run 39073460610). An arch whose published sum is this build's is skipped; any other clash (a different
+    build, or a wheel whose sum never landed) warns in a dry run and still fails a real one, before anything uploads.
+    The workflow's own publish step, run against a fake gh holding sm_100 and lacking sm_120."""
+    _repo_only(".github/workflows/sage-wheels.yml")
+    wf = (BASE / ".github" / "workflows" / "sage-wheels.yml").read_text()
+    step = wf[wf.index("name: publish what was built"):]
+    lines = []
+    for l in step[step.index("run: |\n") + 7:].splitlines():                         # the block scalar: its 10-space indent, or blank
+        if l.strip() and not l.startswith(" " * 10): break
+        lines.append(l[10:])
+    step = "\n".join(lines)
+    fake = tmp_path / "bin"; fake.mkdir()
+    (fake / "gh").write_text('#!/bin/bash\ncase "$1 $2" in\n'
+                             '  "release view") [[ " $* " == *" --json "* ]] && ls "$FAKE_REL"; exit 0;;\n'
+                             '  "release download") while [ $# -gt 0 ]; do [ "$1" = --pattern ] && p="$2"; shift; done; cat "$FAKE_REL/$p" 2>/dev/null || exit 1;;\n'
+                             '  "release upload") echo "REAL UPLOAD ${@: -1}";;\nesac\n')
+    (fake / "curl").write_text('#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && echo "Apache License" > "$2"; shift; done\n')
+    for f in ("gh", "curl"): (fake / f).chmod(0o755)
+    whl = "sageattention-2.2.0-cp314-cp314-linux_x86_64.whl"
+
+    def publish(case, dry, held):
+        w = tmp_path / case; (w / "rel").mkdir(parents=True); (w / "tmp").mkdir()
+        for arch in ("10.0", "12.0"):
+            sm = "sm_" + arch.replace(".", ""); d = w / "dist" / ("sage-" + arch); d.mkdir(parents=True)
+            (d / "key.txt").write_text("sageattention-abc-cp314-torch2.14.1-cu130-%s\n" % sm); (d / whl).write_text("wheel %s\n" % sm)
+        (w / "rel" / ("sm_100." + whl)).write_text("wheel sm_100\n")
+        if held != "no sum":
+            s = subprocess.run(["sha256sum", "sm_100." + whl], cwd=w / "rel", capture_output=True, text=True, check=True).stdout
+            (w / "rel" / "sm_100.sha256").write_text(s if held == "same" else "0" * 64 + s[64:])
+        env = {**os.environ, "PATH": "%s:%s" % (fake, os.environ["PATH"]), "FAKE_REL": str(w / "rel"), "RUNNER_TEMP": str(w / "tmp"),
+               "GITHUB_STEP_SUMMARY": str(w / "summary"), "GITHUB_REPOSITORY": "o/r", "GITHUB_SHA": "x", "TAG": "sage-abc", "SHA": "abc",
+               "SHA12": "abc", "PYTAG": "cp314", "TORCH": "2.14.1", "BACKEND": "cu130", "IMAGE": "img", "RUN_URL": "u", "DRY": dry}
+        r = subprocess.run(["bash", "-c", step], cwd=w, capture_output=True, text=True, env=env)
+        return r.returncode, r.stdout + r.stderr
+
+    rc, out = publish("dry-same", "1", "same")
+    assert rc == 0 and "sm_100 is published, nothing to upload" in out and "DRY (pull request): gh release upload" in out, out
+    assert "/sm_120.sha256" in out and "/sm_100." not in out.split("nothing to upload", 1)[1], out
+    rc, out = publish("real-same", "", "same")
+    assert rc == 0 and "REAL UPLOAD" in out and "/sm_120.sha256" in out, out
+    assert not any(l.startswith("REAL UPLOAD") and "/sm_100." in l for l in out.splitlines()), out
+    for held in ("different", "no sum"):
+        rc, out = publish("dry-" + held, "1", held)
+        assert rc == 0 and "::warning::sage-abc already holds" in out and "::error::" not in out, (held, out)
+        rc, out = publish("real-" + held, "", held)
+        assert rc == 1 and "::error::sage-abc already holds" in out and "published assets are never replaced" in out, (held, out)
+        assert "REAL UPLOAD" not in out, (held, out)                                    # refused before anything uploads
 
 
 def _fake_nvidia_smi(tmp_path, total, used, apps):
@@ -2153,6 +2265,52 @@ def test_unit_hygiene_remove_entries_never_reappear(tmp_path):
     txt = _base_args(tmp_path).read_text()
     assert "--use-sage-attention" not in txt and "--evil" not in txt and "--fast" in txt, txt + r.stdout
     assert "--evil" not in r.stdout.splitlines()[-1] and "--fast" in r.stdout.splitlines()[-1]
+
+
+def test_unit_a_package_sets_cache_ram_with_both_values_and_it_is_off_unless_asked(tmp_path):
+    """3.28.0: HYGIENE_ARGS+=( "--cache-ram 10 32" ) in a package script puts `--cache-ram 10 32` in the args file (ComfyUI's
+    RAM-pressure cache: the active and the inactive cache's headroom in GB, at most two values, comfy/cli_args.py), where
+    any other row keeps one value and it would land as `--cache-ram 10`. With no such row nothing is written. The flag is
+    set by its values, never left with a stray old value (argparse would refuse the stray word and ComfyUI would not
+    start), never beside --cache-classic, --cache-lru or --cache-none (one argparse group), never for a ComfyUI that has no
+    --cache-ram; HYGIENE_ARGS_REMOVE takes it out with both values; a malformed row is refused at the declaration."""
+    for v, want in (("10 32", "YES"), ("10", "YES"), ("10.5  32", "YES"), ("0 0", "YES"), ("10 32 64", "NO"), ("-1", "NO"),
+                    ("ten", "NO"), ("10,32", "NO"), ("", "NO")):
+        assert _bash('_base_cache_ram_ok "$V" && echo YES || echo NO', env={"V": v}).stdout.strip() == want, v
+    comfy = tmp_path / "ComfyUI"; (comfy / "comfy").mkdir(parents=True)
+    (comfy / "comfy" / "cli_args.py").write_text('cache_group.add_argument("--cache-ram", nargs=\'*\', type=float)\n')
+    args = tmp_path / "comfyui_args.txt"
+    run = ('COMFY="%s"; ARGS_FILE="%s"; HYGIENE_ARGS=(); HYGIENE_ARGS_REMOVE=(); %s _base_args_package; echo "RC=$?"; '
+           '_base_args_extra | tr "\\n" " "') % (comfy, args, "%s")
+    args.write_text("# comfy-base launch args\n--fast\n")
+    r = _bash(run % 'HYGIENE_ARGS=( "--reserve-vram 1" );')                    # no --cache-ram row: off, the flag never written
+    assert "RC=0" in r.stdout and args.read_text() == "# comfy-base launch args\n--fast\n--reserve-vram 1\n", r.stdout + r.stderr
+    args.write_text("# comfy-base launch args\n--fast\n")
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram 10 32" );')                  # the 6.0 package's line, as written
+    assert "--cache-ram 10 32\n" in args.read_text() and "--fast --cache-ram 10 32" in r.stdout, r.stdout + r.stderr
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram 10 32" );')
+    assert "--cache-ram 10 32 present" in r.stdout and args.read_text().count("--cache-ram") == 1, r.stdout
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram  8  16 " );')                 # a new value replaces the old, both words
+    assert args.read_text() == "# comfy-base launch args\n--fast\n--cache-ram 8 16\n", args.read_text()
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram 12" );')
+    assert args.read_text() == "# comfy-base launch args\n--fast\n--cache-ram 12\n", args.read_text()
+    args.write_text("--fast --cache-ram 10 32\n")
+    r = _bash(run % 'HYGIENE_ARGS_REMOVE=( --cache-ram );')                     # out with both values, no stray "32"
+    assert args.read_text() == "--fast\n" and "removed --cache-ram 10 32" in r.stdout, args.read_text() + r.stdout
+    args.write_text("--cache-lru 50\n")
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram 10 32" );')
+    assert "--cache-ram" not in args.read_text() and "sets --cache-lru" in r.stdout + r.stderr, r.stdout + r.stderr
+    args.write_text("--fast\n"); (comfy / "comfy" / "cli_args.py").write_text("# an older ComfyUI\n")
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram 10 32" );')
+    assert "--cache-ram" not in args.read_text() and "has no --cache-ram" in r.stdout + r.stderr, r.stdout + r.stderr
+    decl = 'PKG_ID=p; PKG_NAME=P; PKG_VERSION=1.0.0; BASE_MIN=1.0.0; COMFY_MIN=0.0.0; WF_NAME=""; PACKS=(); MODELS=(); '
+    for row in ("--cache-ram 10 32 64", "--cache-ram", "--cache-ram ten"):
+        r = _bash(decl + 'HYGIENE_ARGS=( "$ROW" ); _base_validate_tables; echo RC=$?', env={"ROW": row})
+        assert "RC=1" in r.stdout and "HYGIENE_ARGS '%s'" % row in r.stderr, (row, r.stdout + r.stderr)
+    r = _bash(decl + 'HYGIENE_ARGS=( "--cache-ram 10 32" "--fast" ); _base_validate_tables; echo RC=$?')
+    assert "RC=0" in r.stdout, r.stdout + r.stderr
+    hy = (BASE / "lib" / "70-hygiene.sh").read_text()
+    assert "_base_args_package" in hy[hy.index("base_hygiene(){"):]          # applied by the install's hygiene
 
 
 def test_unit_launch_line_is_composed_from_the_args_file_only(tmp_path):
@@ -2677,6 +2835,21 @@ def test_unit_the_test_command_runs_the_suite_with_the_base_s_own_uv_when_none_i
     assert "RESULT=1 failed, 3 passed RC=1" in r.stdout and "✖ suite" in r.stdout and "✔ suite" not in r.stdout, r.stdout + r.stderr
 
 
+def test_unit_a_red_suite_under_errtrace_is_reported_not_trapped(tmp_path):
+    """3.22.1: a package script runs `set -Eeuo pipefail` with the base's traps, and errtrace carries the ERR trap into
+    base_test. A red suite failed the pipeline into tee, the trap blamed tee and ended the run (exit 4) before the summary.
+    Under those options the runner still reports pytest's own status, and it asks pytest to name every failed and errored
+    test (-rfEs; -rs named only the skips)."""
+    _pod(tmp_path)
+    tools = tmp_path / "comfy-base" / "bin"; tools.mkdir(parents=True)
+    uv = tools / "uv"; uv.write_text('#!/bin/bash\necho "uv $*" >> "$(dirname "$0")/calls.log"\necho "7 failed, 3 passed"\nexit 1\n'); uv.chmod(0o755)
+    r = _bash('BASE_INNER=""; base_env_setup; base_discover quiet; PY=/nonexistent/python; BASE_NODE_SRC=""; '
+              'set -E -o pipefail; _base_install_traps; trap - EXIT; base_test unit; trap - ERR; echo "RESULT=$BASE_TEST_RESULT RC=$BASE_TEST_RC"',
+              env={"BASE_FAKE_ROOT": str(tmp_path), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home")})
+    assert "unexpected failure" not in r.stdout + r.stderr and "RESULT=7 failed, 3 passed RC=1" in r.stdout, r.stdout + r.stderr
+    assert "✖ suite" in r.stdout and " -rfEs " in (tools / "calls.log").read_text(), r.stdout
+
+
 
 def test_unit_the_test_command_takes_quick_as_every_tier_that_needs_no_live_machine(tmp_path):
     """3.16.0, tier 0 (_build/quick.sh): `test quick` runs the suite's declared tiers minus BASE_HEAVY_TIERS, as one -m
@@ -2846,6 +3019,84 @@ def test_unit_restart_opt_in_starts_a_server_when_none_runs(tmp_path):
     assert "R=started" not in r.stdout and not log.exists() and "import check failed" in r.stdout, r.stdout + r.stderr
 
 
+# 3.27.0: a first install starts ComfyUI beside its model downloads; base_restart waits for that start at its old place
+_EARLY = ('PKG_DIR=/nonexistent; WF_NAME=w.json; base_env_setup; base_discover quiet; BASE_NO_NET=0; BASE_DRY=0; PY="%s"; COMFY_LOG="%s"; '
+          'BASE_START_TRIES=3; BASE_RESTART=1; BASE_VENV_RESULT=built; '
+          'base_import_check(){ BASE_IMPORT_DEFERRED=1; echo IMPORTCHECK; }; base_hygiene(){ echo HYGIENE; }; _base_own_packs_judge(){ :; }; '
+          '_base_import_packs(){ :; }; _base_import_result_ok(){ :; }; ')
+
+
+def _starts(log):
+    return log.read_text().count("python argv:") if log.exists() else 0
+
+
+def test_unit_a_first_install_starts_comfyui_beside_the_downloads_and_the_restart_adopts_that_start(tmp_path):
+    """2026-10-17: ComfyUI's cold start (16 s on a B200) came after the models join, prune, sync, the post-models hook and
+    hygiene, though nothing in those needs it. The start now goes right after pkg_pre_models, the import check and hygiene
+    just before it (ComfyUI reads the args at start), and base_restart waits for that same start: ONE start in all."""
+    _pod(tmp_path); bin_, log = _launch_stubs(tmp_path)
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "PATH": "%s:/usr/bin:/bin" % bin_}
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") +
+              '_base_launch_early; echo "S=$BASE_EARLY_STATE D=$BASE_EARLY_DONE"; MODEL_DL=(one); base_restart; '
+              'echo "R=$BASE_RESTART_RESULT VIA=$BASE_RESTART_VIA FAILED=${#BASE_FAILED[@]}"', env=env)
+    out = r.stdout
+    assert "S=launched D=1" in out and "R=started VIA=early FAILED=0" in out, out + r.stderr
+    assert out.index("IMPORTCHECK") < out.index("HYGIENE") < out.index("main.py"), out
+    assert "beside the model downloads" in out and _starts(log) == 1, (out, log.read_text())
+
+
+def test_unit_an_early_start_starts_again_when_what_comfyui_reads_at_start_changed(tmp_path):
+    """extra_model_paths.yaml, the args and the custom_nodes are read once, at start. A package that registers a folder
+    after the early start (from pkg_post_models, not pkg_hygiene) gets today's behaviour: the server is started again."""
+    _pod(tmp_path); bin_, log = _launch_stubs(tmp_path)
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "PATH": "%s:/usr/bin:/bin" % bin_}
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") +
+              '_base_launch_early; printf "pkg:\\n    text_cond: /x\\n" > "$COMFY/extra_model_paths.yaml"; MODEL_DL=(one); base_restart; '
+              'echo "R=$BASE_RESTART_RESULT VIA=$BASE_RESTART_VIA"', env=env)
+    assert "starts again" in r.stdout and "VIA=direct" in r.stdout and _starts(log) == 2, r.stdout + r.stderr
+    # a model that lands after the start changes nothing it reads at start: adopted, one start
+    log.unlink(); (tmp_path / "up").unlink()
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") +
+              '_base_launch_early; mkdir -p "$M/loras"; echo x > "$M/loras/late.safetensors"; MODEL_DL=(one); base_restart; echo "VIA=$BASE_RESTART_VIA"', env=env)
+    assert "VIA=early" in r.stdout and _starts(log) == 1, r.stdout + r.stderr
+
+
+def test_unit_an_early_start_waits_for_code_a_models_row_delivers_and_can_be_turned_off(tmp_path):
+    """A MODELS row may deliver code (custom_nodes/<Pack>/x.py, 5.9.0's viggle_turbo.py): a start before it lands would
+    import the pack without it. Such a row is waited for, at its declared size; past the wait, no early start (today's
+    order). BASE_EARLY_LAUNCH=0 keeps today's order outright, and a run that stops before its restart stops the server."""
+    _pod(tmp_path); bin_, log = _launch_stubs(tmp_path)
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "PATH": "%s:/usr/bin:/bin" % bin_}
+    row = 'MODELS=("custom_nodes|PackZ||z.py|https://example.invalid/z.py|10||code"); BASE_EARLY_CODE_WAIT=0; '
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") + row + '_base_launch_early; echo "S=[$BASE_EARLY_STATE]"', env=env)
+    assert "S=[]" in r.stdout and "custom_nodes/PackZ/z.py" in r.stdout and _starts(log) == 0, r.stdout + r.stderr
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") + row +
+              'mkdir -p "$CN/PackZ"; printf 0123456789 > "$CN/PackZ/z.py"; _base_launch_early; echo "S=[$BASE_EARLY_STATE]"', env=env)
+    assert "S=[launched]" in r.stdout, r.stdout + r.stderr
+    import time
+    for _ in range(50):                                     # the spawned stub runs in the background: let it finish first
+        if (tmp_path / "up").exists() and log.exists():
+            break
+        time.sleep(0.1)
+    log.unlink(missing_ok=True); (tmp_path / "up").unlink(missing_ok=True)
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") + 'BASE_EARLY_LAUNCH=0; _base_launch_early; echo "S=[$BASE_EARLY_STATE] D=$BASE_EARLY_DONE"', env=env)
+    assert "S=[] D=0" in r.stdout and "IMPORTCHECK" not in r.stdout and _starts(log) == 0, r.stdout + r.stderr
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") +
+              '_base_launch_early; _base_stop_comfy(){ touch "%s"; }; _base_early_abandon; echo "S=[$BASE_EARLY_STATE]"' % (tmp_path / "stopped"), env=env)
+    # abandon stops quietly (the summary prints no stop line), so the stand-in leaves a mark instead of a line
+    assert (tmp_path / "stopped").exists() and "S=[]" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_the_pipeline_starts_early_after_pre_models_and_asks_for_the_server_every_half_second():
+    src = code_only((BASE / "lib" / "95-summary.sh").read_text())
+    i, j, k = src.index("_base_hook pkg_pre_models"), src.index("_base_launch_early"), src.index("_base_models_early_join || true")
+    assert i < j < k, "the early start goes after pkg_pre_models and before the models join"
+    assert "_base_early_abandon" in src[src.index("base_summary(){"):]
+    wait = code_only((BASE / "lib" / "85-launch.sh").read_text())
+    body = wait[wait.index("_base_wait_comfy(){"):wait.index("_base_wait_comfy(){") + 2000]
+    assert "sleep 0.5" in body and "sleep 2" not in body
+
+
 def test_unit_the_hand_off_line_is_runnable_as_printed(tmp_path):
     """The stage's hand-off was `cd … && nohup HF_HOME=/x python main.py …`: nohup executes "HF_HOME=/x" as a command.
     Whatever _base_start_cmd prints must run verbatim after nohup (2.0.11)."""
@@ -2890,8 +3141,9 @@ def test_unit_launch_env_is_a_contract_not_a_free_for_all():
     variable the base owns, no shell expansion. A key set twice, or anything else, refuses the package's declarations."""
     good = ["OMP_NUM_THREADS=16", "MKL_NUM_THREADS=8", "CT2_VERBOSE=1", "CT2_USE_EXPERIMENTAL_PACKED_GEMM=1",
             "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512", "TOKENIZERS_PARALLELISM=false",
-            "RENDER_SPEED_ATTENTION=cudnn"]                                          # 3.18.0: a pack's attention order, one word
-    bad = ["PATH=/usr/bin", "RENDER_SPEED_ATTENTION=/x", "RENDER_SPEED=cudnn", "LD_PRELOAD=libx.so", "LD_LIBRARY_PATH=/x", "PYTHONPATH=/x", "HF_HOME=/x", "HF_TOKEN=hf_x",
+            "RENDER_SPEED_ATTENTION=cudnn",                                          # 3.18.0: a pack's attention order, one word
+            "RENDER_SPEED_LANCZOS_THREADS=1", "RENDER_SPEED_LANCZOS_THREADS=8"]      # 3.28.0: its lanczos thread count
+    bad = ["PATH=/usr/bin", "RENDER_SPEED_ATTENTION=/x", "RENDER_SPEED_LANCZOS_THREADS=/x", "RENDER_SPEED_LANCZOS=1", "RENDER_SPEED=cudnn", "LD_PRELOAD=libx.so", "LD_LIBRARY_PATH=/x", "PYTHONPATH=/x", "HF_HOME=/x", "HF_TOKEN=hf_x",
            "VHS_FORCE_FFMPEG_PATH=/x", "COMFY_BASE_STATE=/x", "OMP_NUM_THREADS=", "OMP_NUM_THREADS=$(id)", "OMP_NUM_THREADS=1 2",
            "OMP_NUM_THREADS=/tmp", "OMP_NUM_THREADS=`id`", "ct2_verbose=1", "CT2_=1x;", "OMP_NUM_THREADS", "=1"]
     for kv in good + bad:
@@ -2906,6 +3158,8 @@ def test_unit_launch_env_is_a_contract_not_a_free_for_all():
     assert "RC=1" in r.stdout and "PATH=/x" in r.stderr, r.stdout + r.stderr
     r = _bash(decl + 'LAUNCH_ENV=("OMP_NUM_THREADS=8"); _base_validate_tables; echo RC=$?; _base_declare_dump')
     assert "RC=0" in r.stdout and "LAUNCHENV OMP_NUM_THREADS=8" in r.stdout, r.stdout + r.stderr
+    r = _bash(decl + 'LAUNCH_ENV=( "RENDER_SPEED_LANCZOS_THREADS=1" ); _base_validate_tables; echo RC=$?; _base_declare_dump')
+    assert "RC=0" in r.stdout and "LAUNCHENV RENDER_SPEED_LANCZOS_THREADS=1" in r.stdout, r.stdout + r.stderr   # 3.28.0: the 6.0 line
 
 
 _CPUS64 = "_base_cpus_online(){ echo 64; }; "     # 3.20.3: a host whose CPUs never cap the fake quota (the runner has 2)
@@ -2969,6 +3223,53 @@ def test_unit_launch_env_reaches_comfyui_and_only_comfyui(tmp_path, monkeypatch)
               % (state, bin_ / "python", comfy, tmp_path / "nohup.out"), env=env)
     assert "LINE=env CT2_VERBOSE=1 OMP_NUM_THREADS=2 %s main.py" % (bin_ / "python") in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
     assert "python env OMP=2 CT2=1" in log.read_text()
+
+
+def test_unit_the_cudnn_kernel_cache_is_off_while_the_venv_carries_cudnn_9_22_0_up_to_9_25_1(tmp_path, monkeypatch):
+    """3.28.0: cuDNN 9.22 added a default per-process cache of runtime-compiled kernels, and NVIDIA's cuDNN 9.25.1 release
+    notes (Fixed Issues) say a data corruption in it could cause a segmentation fault: "For cuDNN 9.22-9.24, a workaround
+    was to set the environment variable CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0". torch 2.14.1 pins 9.24.0. So ComfyUI starts
+    with it while the venv's nvidia-cudnn-cu* wheel is 9.22.0 up to 9.25.1 (9.25.0's notes are silent, so it still has the
+    fault), read from the wheel's dist-info name (no torch import); never for another version, never from a package (the key is not a LAUNCH_ENV key), and the machine's own
+    value still wins. Turning the cache off changes no kernel's result."""
+    _no_launch_env(monkeypatch); monkeypatch.delenv("CUDNN_ENABLE_DEFAULT_KERNEL_CACHE", raising=False)
+    for v, want in (("9.21.0.82", "NO"), ("9.22.0", "YES"), ("9.22.0.30", "YES"), ("9.24.0.37", "YES"), ("9.24.1.3", "YES"),
+                    ("9.25.0.12", "YES"), ("9.25.0", "YES"), ("9.25", "YES"), ("9.25.1.4", "NO"), ("9.25.1", "NO"), ("9.25.2.1", "NO"),
+                    ("9.26.0", "NO"), ("10.0.0", "NO"), ("10.22.0", "NO"), ("8.24.0", "NO"), ("", "NO"), ("9", "NO"), ("x.y", "NO"),
+                    ("9.25.x", "NO")):
+        r = _bash('_base_cudnn_cache_bug "$V" && echo YES || echo NO', env={"V": v})
+        assert r.stdout.strip() == want, (v, r.stdout, r.stderr)
+
+    def venv(name, *wheels):
+        site = tmp_path / name / "lib" / "python3.14" / "site-packages"; site.mkdir(parents=True)
+        for w in wheels:
+            (site / ("%s.dist-info" % w)).mkdir()
+        (site / "torch-2.14.1.dist-info").mkdir()
+        return tmp_path / name
+    pinned = venv("pinned", "nvidia_cudnn_cu13-9.24.0.37")
+    fixed = venv("fixed", "nvidia_cudnn_cu13-9.25.1.4")
+    silent = venv("silent", "nvidia_cudnn_cu13-9.25.0.12")                                  # 9.25.0: no fix in its notes
+    both = venv("both", "nvidia_cudnn_cu12-9.10.2.21", "nvidia_cudnn_cu13-9.24.0.37")      # the newest is what is read
+    none = venv("none")
+    for v_, want in ((pinned, "9.24.0.37"), (fixed, "9.25.1.4"), (both, "9.24.0.37"), (none, "")):
+        assert _bash('VENV="%s"; _base_cudnn_version' % v_).stdout.strip() == want, v_
+    assert _bash('VENV=""; PY="%s/bin/python"; _base_cudnn_version' % pinned).stdout.strip() == "9.24.0.37"   # the boot knows PY
+    state = tmp_path / "state"; (state / "launch.d").mkdir(parents=True)
+    le = 'BASE_STATE="%s"; VENV="%%s"; _base_launch_env' % state
+    env = {"BASE_CGROUP_ROOT": str(tmp_path / "nocgroup")}                    # no quota: the cuDNN line is the only default
+    for v_ in (pinned, silent):
+        r = _bash(le % v_, env=env)
+        assert r.stdout == "CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0\n" and r.stderr == "", (v_, r.stdout + r.stderr)
+    for v_ in (fixed, none):
+        assert _bash(le % v_, env=env).stdout == "", v_
+    r = _bash(le % pinned, env=dict(env, CUDNN_ENABLE_DEFAULT_KERNEL_CACHE="1"))
+    assert r.stdout == "" and "CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=1 is set in this machine's environment" in r.stderr, r.stdout + r.stderr
+    r = _bash('_base_launch_env_ok "CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0" && echo YES || echo NO')
+    assert r.stdout.strip() == "NO"                                           # the base's to set, never a package's
+    # it reaches ComfyUI's process with the rest of the launch environment, on the hand-off line too
+    bin_ = pinned / "bin"; bin_.mkdir()
+    r = _bash('BASE_STATE="%s"; VENV="%s"; PY="%s/python"; PORT=8188; ARGS_FILE=/nonexistent; _base_start_cmd' % (state, pinned, bin_), env=env)
+    assert "env CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0 %s/python main.py" % bin_ in r.stdout, r.stdout + r.stderr
 
 
 # ---------------------------------------------------------------- 3.20.0: one ComfyUI per GPU
@@ -3297,6 +3598,19 @@ def test_unit_start_waits_while_the_process_lives_and_gives_up_when_it_dies(tmp_
     # the old tries-based knob still sizes the window, so existing callers keep working
     r = _bash(base + '_base_comfy_pids(){ echo 424242; }; BASE_START_TRIES=2; _base_start_comfy; echo RC=$?')
     assert "RC=1" in r.stdout and "after 4 s" in r.stdout, r.stdout
+
+
+def test_unit_the_restart_is_seen_within_a_second_of_answering(tmp_path):
+    # 3.26.0: the wait asks every second, not every two; a closed port answers at once, so asking costs nothing.
+    # 3.27.0: every half second (the early start's wait), reported to the half second
+    bin_ = tmp_path / "bin"; bin_.mkdir()
+    (bin_ / "curl").write_text("#!/bin/bash\nexit 0\n"); (bin_ / "curl").chmod(0o755)
+    r = _bash('HOSTPORT=127.0.0.1:8188; _base_comfy_pids(){ echo 424242; }; _base_wait_comfy; echo RC=$?', env={"PATH": "%s:/usr/bin:/bin" % bin_})
+    assert "up after 0.5 s" in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
+    src = (BASE / "lib" / "85-launch.sh").read_text(encoding="utf-8")
+    for fn, nxt in (("_base_wait_server(){", "_base_wait_comfy(){"), ("_base_wait_comfy(){", "\n}\n")):
+        body = src[src.index(fn):]; body = body[:body.index(nxt, len(fn))]
+        assert "sleep 0.5; half=$((half + 1))" in body and "sleep 2" not in body and "sleep 1;" not in body, fn
 
 
 # ---------------------------------------------------------------- T21: the two modes of 2.1.0 (a baked template image)
@@ -3808,4 +4122,21 @@ def test_unit_the_boot_stops_a_comfyui_it_does_not_own_before_starting_its_own()
                         'declare -F _base_comfy_pids _base_pids_from_table _base_stop_comfy _base_wait_comfy' % BASE],
                        capture_output=True, text=True)
     assert r.returncode == 0 and len(r.stdout.split()) == 4, r.stdout + r.stderr
+
+
+def test_build_tools_default_to_their_own_testbed_port():
+    """3.27.1: a tool's --server default is BASE_SERVER, else 127.0.0.1:$TESTBED_PORT, else 8199. A runner Space runs two
+    runners (workspace ci/hf-runner/), each with its own TESTBED_PORT (8199, 8299); a bare 8199 default reached the other
+    runner's testbed in the middle of its gate (photo-auditor's engine job, 2026-10-25)."""
+    import re
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_build")
+    bare = []
+    for d, _, files in os.walk(root):
+        for f in files:
+            if f.endswith((".py", ".sh")):
+                p = os.path.join(d, f)
+                for i, line in enumerate(open(p, encoding="utf-8", errors="replace"), 1):
+                    if re.search(r"""(default=|:-)["']?127\.0\.0\.1:8199""", line) or re.search(r"""or ["']127\.0\.0\.1:8199["']""", line):
+                        bare.append(f"{os.path.relpath(p, root)}:{i}")
+    assert bare == [], bare
 

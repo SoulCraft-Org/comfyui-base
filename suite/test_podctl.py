@@ -72,6 +72,11 @@ class FakeRunPod:
         self.secrets = []                                 # 3.19.0: the account's RunPod Secret NAMES (REST v2 GET /v2/account/secrets)
         self.secrets_fail = None                          # 3.19.0: an HTTP status the listing answers with instead
         self.secrets_auth = []                            # 3.19.0: the Authorization header of every listing
+        self.v2_cuda = ["13.2"]                           # 3.29.0: what GET /v2/pods/{id} answers as cudaVersion, read by read (the last repeats)
+        self.v2_pod_reads = []                            # 3.29.0: the pod ids GET /v2/pods/{id} was asked for
+        self.catalog = None                               # 3.29.0: GET /v2/catalog/gpus's answer; None derives it from the GraphQL stock
+        self.catalog_cuda = "13.2"                        # 3.29.0: the derived catalog's hosts report this CUDA (minCudaVersion above it: NONE)
+        self.catalog_queries = []                         # 3.29.0: the query of every catalog read, parsed
         srv = self
 
         class H(BaseHTTPRequestHandler):
@@ -101,6 +106,16 @@ class FakeRunPod:
                         return self._send(srv.secrets_fail, {"title": "refused", "status": srv.secrets_fail, "detail": "the fake refuses"})
                     return self._send(200, {"secrets": [{"id": "sec%04d" % i, "name": n, "description": None, "createdAt": "2026-10-16T00:00:00Z",
                                                          "valueLastUpdatedAt": None} for i, n in enumerate(srv.secrets)]})
+                if path.startswith("/v2/pods/"):            # 3.29.0: REST v2 getPod, the host's cudaVersion (null at first)
+                    pid = path.split("/")[3]
+                    srv.v2_pod_reads.append(pid)
+                    v = srv.v2_cuda.pop(0) if len(srv.v2_cuda) > 1 else (srv.v2_cuda or [None])[0]
+                    return self._send(200, {"id": pid, "desiredStatus": srv.pod.get("desiredStatus"), "cudaVersion": v})
+                if path == "/v2/catalog/gpus":              # 3.29.0: listGpus with include=AVAILABILITY and minCudaVersion
+                    import urllib.parse
+                    q = dict(urllib.parse.parse_qsl(self.path.partition("?")[2]))
+                    srv.catalog_queries.append(q)
+                    return self._send(200, srv.catalog_answer(q))
                 if srv.rest:
                     res = srv.rest("GET", path, None)
                     if res is not None:
@@ -189,6 +204,23 @@ class FakeRunPod:
 
     def mapping_when_running(self):
         return {"22": 15270} if "22/tcp" in self.pod.get("ports", []) else {}
+
+    def catalog_answer(self, q):
+        """3.29.0: the v2 catalog for query `q`: self.catalog when a test sets one (a dict, or a function of the query),
+        else the GraphQL stock view re-said in the catalog's shape, every data centre NONE when the query's
+        minCudaVersion is above catalog_cuda (RunPod's hosts below a floor are not counted)."""
+        if self.catalog is not None:
+            return self.catalog(q) if callable(self.catalog) else self.catalog
+        data = self.gql({"query": "query { dataCenters { id name location storageSupport gpuAvailability { gpuTypeId stockStatus available } } }",
+                         "variables": {}}) if callable(self.gql) else self.gql
+        key = lambda v: tuple(int(x) for x in v.split("."))
+        low = bool(q.get("minCudaVersion")) and key(q["minCudaVersion"]) > key(self.catalog_cuda)
+        gpus = {}
+        for dc in (data or {}).get("dataCenters") or []:
+            for g in dc.get("gpuAvailability") or []:
+                av = "NONE" if low or not g.get("available") else (g.get("stockStatus") or "Low").upper()
+                gpus.setdefault(g["gpuTypeId"], []).append({"id": dc["id"], "name": dc["id"], "availability": av})
+        return {"gpus": [{"id": k, "availability": "LOW", "dataCenters": v} for k, v in gpus.items()]}
 
     def close(self):
         self.httpd.shutdown(); self.httpd.server_close()
@@ -290,7 +322,6 @@ Host runpod
   IdentityFile ~/.ssh/id_ed25519
   LocalForward 8188 localhost:8188
   LocalForward 9199 localhost:9199
-  LocalForward 11434 localhost:11434
 
 Host other
   HostName 10.0.0.1
@@ -553,19 +584,216 @@ def test_unit_podctl_upload_verifies_size_and_sha256_on_both_sides(tmp_path):
     digest = hashlib.sha256(f.read_bytes()).hexdigest()
     bin_ = tmp_path / "bin"; bin_.mkdir()
     log = tmp_path / "calls.log"
-    (bin_ / "scp").write_text('#!/bin/bash\necho "scp $*" >> "%s"\nexit 0\n' % log); (bin_ / "scp").chmod(0o755)
-    # the remote sha256sum answers with whatever the test plants in remote.txt
-    (bin_ / "ssh").write_text('#!/bin/bash\necho "ssh $*" >> "%s"\ncat "%s/remote.txt"\n' % (log, tmp_path)); (bin_ / "ssh").chmod(0o755)
+    # the remote sha256sum answers with whatever the test plants in remote.txt, once scp has sent something (3.24.0: the
+    # probe before the send finds nothing on a fresh machine)
+    (bin_ / "scp").write_text('#!/bin/bash\necho "scp $*" >> "%s"\ntouch "%s/sent"\nexit 0\n' % (log, tmp_path)); (bin_ / "scp").chmod(0o755)
+    (bin_ / "ssh").write_text('#!/bin/bash\necho "ssh $*" >> "%s"\n[ -f "%s/sent" ] && cat "%s/remote.txt"\nexit 0\n' % (log, tmp_path, tmp_path)); (bin_ / "ssh").chmod(0o755)
     env = {**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"])}
     (tmp_path / "remote.txt").write_text("%d %s  /workspace/packages/Pkg-runpod.zip\n" % (f.stat().st_size, digest))
     out = podctl.upload([f], "/workspace/packages", env=env)
     calls = log.read_text()
     assert "scp " in calls and "runpod:/workspace/packages/" in calls and "mkdir -p /workspace/packages" in calls
     assert "Pkg-runpod.zip" in out and "ok" in out
-    (tmp_path / "remote.txt").write_text("12 0000  /workspace/packages/Pkg-runpod.zip\n")
+    (tmp_path / "remote.txt").write_text("12 0000  /workspace/packages/Pkg-runpod.zip\n"); (tmp_path / "sent").unlink()
     with pytest.raises(podctl.PodctlError) as ei:
         podctl.upload([f], "/workspace/packages", env=env)
     assert "sha256" in str(ei.value) or "size" in str(ei.value)
+
+
+def _pod_dir_ssh(tmp_path, root):
+    """An ssh and an scp on PATH that act on a local directory standing in for the machine: ssh drops its options and the
+    host and runs the command in bash with /workspace mapped to `root`; scp copies into the mapped directory. Every call
+    is logged, one line each."""
+    import shlex
+    bin_ = tmp_path / "bin"; bin_.mkdir(exist_ok=True); log = tmp_path / "calls.log"
+    (bin_ / "ssh").write_text(
+        '#!/bin/bash\necho "ssh" >> %s\nwhile [ "$1" = "-o" ]; do shift 2; done\nshift\n'
+        'exec bash -c "${1//\\/workspace/%s}"\n' % (shlex.quote(str(log)), root))
+    (bin_ / "scp").write_text(
+        '#!/bin/bash\necho "scp $*" >> %s\nwhile [ "${1#-}" != "$1" ]; do [ "$1" = "-o" ] && shift; shift; done\n'
+        'dest="${@: -1}"; dest="${dest#*:}"; dest="${dest/\\/workspace/%s}"; set -- "${@:1:$(($# - 1))}"; cp "$@" "$dest"\n'
+        % (shlex.quote(str(log)), str(root)))
+    for b in ("ssh", "scp"):
+        (bin_ / b).chmod(0o755)
+    return {**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"])}, log
+
+
+def test_unit_podctl_upload_sends_only_what_the_machine_lacks_in_three_round_trips(tmp_path):
+    """3.24.0. The 2026-10-17 install paid a new ssh connection for every command: mkdir, scp and sha256 for the base zip,
+    then again for the package's. Now one upload takes every zip: a probe (mkdir and the sums of what is already there),
+    ONE scp of the files that differ, one check of what was sent. A file already there with the same size and sha256 is
+    not sent again, and is still reported, because the probe proved it the same way the check proves a sent one."""
+    import shutil
+    if not shutil.which("sha256sum"):
+        pytest.skip("no sha256sum on this machine (the pod has GNU coreutils)")
+    podctl = _load()
+    root = tmp_path / "pod"; root.mkdir()
+    env, log = _pod_dir_ssh(tmp_path, root)
+    a = tmp_path / "a.zip"; a.write_bytes(b"a" * 1000)
+    b = tmp_path / "b.zip"; b.write_bytes(b"b" * 2000)
+    out = podctl.upload([a, b], "/workspace/packages", env=env)
+    calls = log.read_text().splitlines()
+    assert [c.split()[0] for c in calls] == ["ssh", "scp", "ssh"], calls                      # probe, one scp, one check
+    assert "a.zip" in calls[1] and "b.zip" in calls[1]
+    assert (root / "packages" / "b.zip").read_bytes() == b.read_bytes()
+    assert out.count("ok  ") == 2 and "not sent" not in out
+    # the same two again: nothing is sent, one round trip
+    log.write_text("")
+    out = podctl.upload([a, b], "/workspace/packages", env=env)
+    assert log.read_text().splitlines() == ["ssh"] and out.count("(already there: not sent)") == 2, out
+    # one changed: only that one goes
+    b.write_bytes(b"B" * 2000); log.write_text("")
+    out = podctl.upload([a, b], "/workspace/packages", env=env)
+    calls = log.read_text().splitlines()
+    assert [c.split()[0] for c in calls] == ["ssh", "scp", "ssh"] and "b.zip" in calls[1] and "a.zip" not in calls[1], calls
+    assert (root / "packages" / "b.zip").read_bytes() == b"B" * 2000
+    # and a file the machine holds under that name with other bytes (same size) is re-sent, never trusted by its name
+    (root / "packages" / "a.zip").write_bytes(b"x" * 1000); log.write_text("")
+    podctl.upload([a, b], "/workspace/packages", env=env)
+    assert "a.zip" in log.read_text() and (root / "packages" / "a.zip").read_bytes() == a.read_bytes()
+
+
+def test_unit_podctl_lease_release_is_one_round_trip_and_never_drops_another_holders(tmp_path, monkeypatch):
+    """3.24.0: release was a read and then a remove, a round trip each. The machine now decides in one command: the file
+    goes when it is empty, holds no holder (unreadable: free), or names this holder exactly as lease_encode writes it."""
+    podctl = _load()
+    root = tmp_path / "pod"; root.mkdir()
+    env, log = _pod_dir_ssh(tmp_path, root)
+    monkeypatch.setenv("PATH", env["PATH"])
+    lease = root / "gpu.lease"
+    monkeypatch.setattr(podctl, "LEASE_PATH", str(lease))
+    def put(holder, purpose=""):
+        lease.write_text(podctl.lease_encode(holder, purpose, 30, session="") + "\n")
+    put("someone-else", 'install for "holder": "me"')                 # my name inside another field must not match
+    log.write_text("")
+    assert podctl.lease_release("me") is False and lease.exists()
+    assert log.read_text().splitlines() == ["ssh"]
+    put("me2")                                                          # a longer name is another holder
+    assert podctl.lease_release("me") is False and lease.exists()
+    put("me")
+    assert podctl.lease_release("me") is True and not lease.exists()
+    assert podctl.lease_release("me") is True                           # already gone
+    lease.write_text("not json\n")
+    assert podctl.lease_release("me") is True and not lease.exists()    # unreadable reads as free, so it goes
+
+
+def test_unit_podctl_install_takes_the_lease_and_writes_host_env_in_one_round_trip(tmp_path, monkeypatch):
+    """3.28.0: an install wrote its lease and then state/host.env, a round trip each. lease_take_with sends both in one
+    command and judges the lease exactly as lease_take does (its own exit status; a PodctlError when it could not be
+    written). The second write runs whatever the lease did, and when it fails the caller writes host.env on its own
+    round trip, where write_host_env says its own error, as before. The lines printed are the same."""
+    import inspect, pytest
+    podctl = _load()
+    root = tmp_path / "pod"; root.mkdir()
+    env, log = _pod_dir_ssh(tmp_path, root)
+    monkeypatch.setenv("PATH", env["PATH"])
+    lease = root / "local-state" / "gpu.lease"
+    monkeypatch.setattr(podctl, "LEASE_PATH", str(lease))
+    monkeypatch.setattr(podctl, "VOLUME_ROOT", "/workspace")
+
+    class Prov:
+        name = "runpod"
+        def host_env(self):
+            return "BASE_HOST=runpod\nBASE_VOLUME_KIND=mount\n"       # no /workspace in it: the stand-in ssh maps that string
+    cmd, line = podctl.host_env_write(Prov())
+    assert line == "host    runpod (state/host.env: BASE_HOST=runpod BASE_VOLUME_KIND=mount)"
+    log.write_text("")
+    got, ok = podctl.lease_take_with("me", "install: My Pkg", 30, cmd)
+    assert ok is True and got["holder"] == "me" and got["purpose"] == "install: My Pkg"
+    assert log.read_text().splitlines() == ["ssh"]                                   # one round trip for both writes
+    assert podctl.lease_parse(lease.read_text())["holder"] == "me"
+    assert (root / "comfy-base" / "state" / "host.env").read_text() == Prov().host_env()
+    got, ok = podctl.lease_take_with("me", "x", 30, "false")
+    assert got["holder"] == "me" and ok is False                                     # the lease stands; host.env is retried alone
+    monkeypatch.setattr(podctl, "LEASE_PATH", "/proc/podctl-no-such/gpu.lease")
+    with pytest.raises(podctl.PodctlError):
+        podctl.lease_take_with("me", "x", 30, cmd)
+    assert podctl.write_host_env(Prov(), env=env) == line                             # the single path still says the same
+    src = inspect.getsource(podctl.cmd_install)
+    assert "lease_take_with(" in src and "host_line if host_ok else write_host_env(prov)" in src and "lease_take(" not in src
+
+
+def test_unit_podctl_install_asks_both_gpu_questions_in_one_round_trip(tmp_path, monkeypatch, capsys):
+    """3.28.0: the GPU gate (is the card ours?) and the GPU_PREFER note (is it what the package is tuned for?) were two
+    nvidia-smi round trips; the note's question now rides in the gate's (gpu_probe(fit=True)) and the note reads that
+    answer. The lines and their order are unchanged, and a package with no GPU_PREFER asks only the gate's question."""
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path)
+    (pkg / "My Pkg-script.sh").write_text('GPU_PREFER="B200 B300"\n' + (pkg / "My Pkg-script.sh").read_text())
+    d = tmp_path / "smi"; d.mkdir()
+    (d / "nvidia-smi").write_text('#!/bin/bash\ncase "$*" in *query-gpu=name,compute_cap,memory.total*) echo "NVIDIA B200, 10.0, 183359";; '
+                                  '*query-gpu=memory*) echo "183359, 600, GPU-a";; *query-compute-apps*) :;; *) exit 1;; esac\n')
+    (d / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", "%s:%s" % (d, os.environ["PATH"]))
+    io = LocalPodIO(tmp_path / "pod")
+    rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-10-26", save_pins=False)
+    out = capsys.readouterr().out
+    asked = [c for c in io.cmds if "nvidia-smi" in c]
+    assert rc == 0 and len(asked) == 1 and "compute_cap" in asked[0] and "query-compute-apps" in asked[0], asked
+    assert "the GPU is ours" in out and "gpu fit NVIDIA B200 is what My Pkg is tuned for" in out, out
+    assert out.index("the GPU is ours") < out.index("gpu fit") < out.index("extracted")
+    (pkg / "My Pkg-script.sh").write_text("PACKS=()\n")
+    io = LocalPodIO(tmp_path / "pod2")
+    assert podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-10-26", save_pins=False) == 0
+    asked = [c for c in io.cmds if "nvidia-smi" in c]
+    assert len(asked) == 1 and "compute_cap" not in asked[0], asked
+
+
+def test_unit_podctl_command_sessions_share_one_connection_that_never_forwards(monkeypatch):
+    """3.24.0: one ssh connection per machine (ControlMaster), because a handshake to a pod is about 11 round trips: 1.8 s to
+    EU-RO-1, about 21 of them per install. The master is whichever command comes first, so it carries the command sessions'
+    ClearAllForwardings and never binds the Host block's LocalForwards (the tunnel is its own session). The socket path
+    must fit a unix socket (103 bytes on macOS) or the run goes unmultiplexed; PODCTL_SSH_MUX=0 turns it off."""
+    podctl = _load()
+    opts = podctl.ssh_mux_opts({"PODCTL_SSH_MUX_DIR": "/tmp/pcm"})
+    joined = " ".join(opts)
+    assert "ControlMaster=auto" in joined and "ControlPath=/tmp/pcm/%C" in joined and "ControlPersist=" in joined
+    # 3.28.0: the master outlives the Mac's own gate (the package's suite from its zip, minutes on a new zip), which sits
+    # between the lease and the upload: at 120 s it lapsed there and the upload paid a fresh handshake
+    assert podctl.SSH_MUX_PERSIST >= 600 and "ControlPersist=%d" % podctl.SSH_MUX_PERSIST in joined
+    assert "ServerAliveInterval=" in joined                              # a stopped machine's master does not linger
+    assert podctl.ssh_mux_opts({"PODCTL_SSH_MUX": "0"}) == []
+    assert podctl.ssh_mux_opts({"PODCTL_SSH_MUX_DIR": "/" + "d" * 70}) == []       # the socket would not fit
+    for cmd in (podctl.SSH_CMD, podctl.SCP_CMD):
+        assert "ClearAllForwardings=yes" in cmd
+    assert not any("Control" in a for a in podctl.tunnel_argv(host="h", port=1, key="k"))
+
+
+def test_unit_podctl_ssh_retries_a_dead_master_only_before_the_command_started(tmp_path, monkeypatch):
+    """A master whose machine was stopped or restarted fails the next session request before the command starts: that one
+    case closes the master and runs the command again. A failure after the command started is never retried, because
+    a second launch of an install would be a second install."""
+    import subprocess
+    podctl = _load()
+    calls = []
+    answers = []
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        if "-O" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return answers.pop(0)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    answers[:] = [subprocess.CompletedProcess([], 255, "", "mux_client_request_session: read from master failed: Broken pipe"),
+                  subprocess.CompletedProcess([], 0, "ok\n", "")]
+    r = podctl.ssh_run("echo ok")
+    assert r.returncode == 0 and r.stdout == "ok\n"
+    if any(a.startswith("ControlPath=") for a in podctl.SSH_CMD):
+        assert any("-O" in c and "exit" in c for c in calls), calls
+    calls.clear()
+    answers[:] = [subprocess.CompletedProcess([], 255, "", "Connection to 1.2.3.4 closed by remote host.")]
+    assert podctl.ssh_run("launch").returncode == 255 and len(calls) == 1
+
+
+def test_unit_podctl_install_sees_the_end_of_a_step_within_a_second(tmp_path):
+    """3.24.0: the poll waits on the machine, looking for STEP RC once a second, so a step that ends early is seen at
+    once, however long --every is. A sleep here between polls saw it every/2 seconds late on average."""
+    import time
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path); io = LocalPodIO(tmp_path / "pod")
+    t0 = time.monotonic()
+    assert podctl.install("pod1", [pkg], io, every=30, timeout=600, today="2026-10-25", save_pins=False) == 0
+    assert time.monotonic() - t0 < 15, "a 30 s poll interval held a finished step"
+    assert io.slept == 0
 
 
 def test_unit_podctl_cli_upload_takes_the_pod_then_files():
@@ -709,7 +937,8 @@ def test_unit_podctl_install_runs_the_documented_sequence_and_stops_at_the_first
     out = capsys.readouterr().out
     assert rc == 0, out
     cmds = io.cmds
-    assert [u[0][0].split("/")[-1] for u in io.uploads] == ["comfyui-base.zip", "My Pkg-runpod.zip"]
+    # 3.24.0: every zip in ONE upload, after every zip was checked: three round trips in all, not three per item
+    assert [[pathlib.Path(f).name for f in u[0]] for u in io.uploads] == [["comfyui-base.zip", "My Pkg-runpod.zip"]]
     # 3.2.0: with a package after it, the base is INSTALLED (and its suite run once per base version), never run as a
     # second whole pipeline: the package's run already does everything the base's own run did
     extract = [c for c in cmds if "zipfile -e" in c]; selfs = [c for c in cmds if "install-self" in c and "nohup" not in c]
@@ -788,7 +1017,10 @@ def test_unit_podctl_install_launches_the_run_detached_and_polls_it(tmp_path):
     io = SleepingPodIO(tmp_path / "pod")
     rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-09-06", save_pins=False)
     assert rc == 0
-    assert io.slept >= 1, "the launch blocked until the step ended: the poll loop never had to wait"
+    # 3.24.0: the wait is on the machine (each poll waits there up to `every` s), so the proof is the polls: a launch that
+    # blocked until the step ended would find STEP RC at the very first one
+    polls = [c for c in io.cmds if "grep -q" in c and "STEP RC=" in c and "nohup" not in c]
+    assert len(polls) >= 2, "the launch blocked until the step ended: the poll loop never had to wait"
     run = [c for c in io.cmds if "STEP RC=" in c and "nohup" in c][0]
     assert "{ nohup setsid" in run and run.rstrip().endswith("& }"), run
 
@@ -1407,7 +1639,7 @@ def test_unit_each_workflow_gets_its_own_local_port():
     assert seen == {0: 8188, 1: 8189, 2: 8190}, seen
     # every service moves together, or the second machine's jupyter collides while its comfy does not
     two = m.tunnel_locals(env={m.TUNNEL_OFFSET_ENV: "2"})
-    assert two == {"comfy": 8190, "jupyter": 8890, "metrics": 9201, "ollama": 11436}, two
+    assert two == {"comfy": 8190, "jupyter": 8890, "metrics": 9201}, two
     # a bad value is refused, never silently read as 0 - 0 is the collision it was set to avoid
     for bad in ("x", "-1", "9999"):
         try:
@@ -1415,6 +1647,45 @@ def test_unit_each_workflow_gets_its_own_local_port():
         except m.PodctlError:
             pass
     assert m._block_for("any-alias", "root", "/k").count("LocalForward 8188 localhost:8188") == 1
+
+
+def test_unit_tunnel_base_puts_every_local_port_in_the_workstations_block(monkeypatch):
+    """3.23.0: a workstation may keep its local listeners in a block of its own (3100-3199 for one account, 3200-3299 for
+    the next) and the vendors' numbers empty. No offset in 0-1000 reaches such a block from 8188, so $PODCTL_TUNNEL_BASE
+    gives each machine ten local ports there: the services at fixed slots, the app ports after them by port. The remote
+    side never moves. 11434 is no longer forwarded at all (no package runs an inference server on the machine)."""
+    m = _load()
+    assert [r for _, r in m.TUNNEL_SERVICES] == [8188, 8888, 9199]
+    assert "11434" not in m.SSH_BLOCK and m._block_for("a", "root", "/k").count("LocalForward") == 3
+    assert m.tunnel_base(env={}) is None
+    env = {m.TUNNEL_BASE_ENV: "3180"}
+    assert m.tunnel_locals(env=env) == {"comfy": 3180, "jupyter": 3181, "metrics": 3182}
+    # machine N of the fleet takes the next ten: two machines never share a port, and neither leaves the block
+    env1 = {m.TUNNEL_BASE_ENV: "3180", m.TUNNEL_OFFSET_ENV: "1"}
+    assert m.tunnel_locals(env=env1) == {"comfy": 3190, "jupyter": 3191, "metrics": 3192}
+    # app ports follow the services in PORT order, so one app keeps one local port however the list was gathered
+    assert m.tunnel_local_ports([8189, 8188, 8201], env) == {8188: 3180, 8189: 3183, 8201: 3184}
+    assert m.tunnel_local_ports([8201, 8189], env) == {8189: 3183, 8201: 3184}
+    # without a base nothing changes: the remote port plus the offset
+    assert m.tunnel_local_ports([8188, 8189], {m.TUNNEL_OFFSET_ENV: "2"}) == {8188: 8190, 8189: 8191}
+    # refused, never ignored: ignoring it would bind the very ports it was set to keep empty
+    for bad in ({m.TUNNEL_BASE_ENV: "x"}, {m.TUNNEL_BASE_ENV: "80"}, {m.TUNNEL_BASE_ENV: "65530"},
+                {m.TUNNEL_BASE_ENV: "60000", m.TUNNEL_OFFSET_ENV: "1000"}):
+        try:
+            m.tunnel_base(env=bad); raise AssertionError("accepted %r" % bad)
+        except m.PodctlError:
+            pass
+    try:
+        m.tunnel_local_ports(list(range(9000, 9008)), env); raise AssertionError("an eleventh port took the next machine's slot")
+    except m.PodctlError as e:
+        assert "--port" in str(e)
+    # the ssh-config block, the jupyter hint and the mcp tunnel transport all read the same numbers
+    monkeypatch.setenv(m.TUNNEL_BASE_ENV, "3180")
+    blk = m._block_for("a", "root", "/k")
+    assert "LocalForward 3180 localhost:8188\n  LocalForward 3181 localhost:8888\n  LocalForward 3182 localhost:9199\n" in blk, blk
+    assert m.mcp_server("a", "tunnel")["env"]["COMFYUI_URL"] == "http://127.0.0.1:3180"
+    for vendor in ("8188", "8888", "9199", "11434"):
+        assert "LocalForward %s " % vendor not in blk
 
 
 # ---------------------------------------------------------------- 2.7.0: the .mcp.json podctl writes
@@ -1426,7 +1697,7 @@ def test_unit_mcp_over_ssh_runs_the_server_on_the_machine():
     srv = podctl.mcp_server("runpod", "ssh", bin_path="/workspace/ComfyUI/.venv-cu130/bin/comfy-mcp")
     assert srv["command"] == "ssh"
     a = srv["args"]
-    # not cosmetic: the Host block ssh-config writes carries four LocalForward lines, and a second session
+    # not cosmetic: the Host block ssh-config writes carries the LocalForward lines, and a second session
     # binding them while `podctl tunnel` holds them prints warnings onto the stdio channel MCP speaks.
     assert "ClearAllForwardings=yes" in a, a
     assert a[-2] == "runpod", a
@@ -1510,7 +1781,7 @@ def test_unit_podctl_a_restart_required_run_prints_the_restart_to_approve(tmp_pa
     orig = io.remote
     def remote(cmd):
         rc, out, err = orig(cmd)
-        if cmd.startswith("cat ") and "STEP RC=1" in out:
+        if "grep -q" in cmd and "STEP RC=1" in out:
             out = out.replace("STEP RC=1", "  !! restart required: driver 580.178.04 -> 615.71.09\nSTEP RC=1")
         return rc, out, err
     io.remote = remote
@@ -1530,8 +1801,8 @@ def _buyer_zips(tmp_path):
         z.writestr("comfyui-base/base.sh", BASE_SH_STUB % (STUB_SCRIPT % ("..", "base")))
     with zipfile.ZipFile(d / "my-pkg-verda.zip", "w") as z:
         z.writestr("my-pkg-script.sh", STUB_SCRIPT % ("../..", "my-pkg"))
-    rt = tmp_path / "rt"; rt.mkdir(); part = rt / "runtime.tar.gz.000"; part.write_bytes(b"part")
-    (rt / "runtime.json").write_text(json.dumps({"format": 1, "parts": [{"name": part.name, "url": part.name, "bytes": 4,
+    rt = tmp_path / "rt"; rt.mkdir(); part = rt / "runtime.000.tar.zst"; part.write_bytes(b"part")
+    (rt / "runtime.json").write_text(json.dumps({"format": 2, "parts": [{"name": part.name, "url": part.name, "bytes": 4,
                                                                          "sha256": hashlib.sha256(b"part").hexdigest()}]}))
     return d, rt / "runtime.json"
 
@@ -1569,7 +1840,7 @@ def test_unit_buyer_install_applies_the_runtime_then_installs_staged_with_no_gat
     for r in runs:
         assert "BASE_RUNTIME=" in r and "BASE_STAGED=" in r and re.search(r"BASE_FETCH_JOBS=\W{0,12}3\W", r), r   # the whole line is quoted once more
     uploaded = [pathlib.Path(f).name for u in io.uploads for f in u[0]]
-    assert "runtime.json" in uploaded and "runtime.tar.gz.000" in uploaded
+    assert "runtime.json" in uploaded and "runtime.000.tar.zst" in uploaded
     assert io.rebuilt == [] and "pins" not in out                       # nothing is written back on a buyer's machine
     assert (tmp_path / "logs").is_dir()
 
@@ -1772,7 +2043,7 @@ def test_unit_runpod_create_checks_stock_first_then_makes_the_volume_and_the_pod
     jl = [l for l in out.splitlines() if "Jupyter Terminal" in l and host(l).endswith(".proxy.runpod.net")]
     assert len(jl) == 1 and jl[0].split()[-1] == "https://newpod0000001-8888.proxy.runpod.net/lab" and "token=" not in out, out
     assert body["gpuTypeIds"] == ["NVIDIA B200"] and body["gpuCount"] == 1
-    assert body["allowedCudaVersions"] == ["13.0"] and body["containerDiskInGb"] == 100 and body["imageName"] == "runpod/comfyui:1.4.7-cuda13.0"
+    assert "allowedCudaVersions" not in body and body["containerDiskInGb"] == 100 and body["imageName"] == "runpod/comfyui:1.4.7-cuda13.0"
     assert "templateId" not in body and body["interruptible"] is False   # this fake has no templates
     # 3.14.0: a new pod starts on the base's boot guard and sshd, never its image's own start (error log row 71)
     assert body["dockerStartCmd"] == [] and body["dockerEntrypoint"][2].startswith(podctl.BOOT_GUARD)
@@ -1793,7 +2064,8 @@ def test_unit_runpod_create_reuses_a_volume_and_a_refusal_takes_only_its_own_vol
         _create(podctl, srv, pub, "--volume", "oldvol", "--min-cuda", "12.8")
         assert "/networkvolumes" not in srv.posts
         body = srv.bodies[-1][1]
-        assert body["networkVolumeId"] == "oldvol" and body["dataCenterIds"] == ["US-CA-2"] and body["allowedCudaVersions"] == ["13.0", "12.9", "12.8"]
+        assert body["networkVolumeId"] == "oldvol" and body["dataCenterIds"] == ["US-CA-2"] and "allowedCudaVersions" not in body
+        assert srv.catalog_queries[-1]["minCudaVersion"] == "12.8"                      # 3.29.0: --min-cuda is the stock floor
         # a volume whose data centre has no stock: STOP, and say the volume is why
         assert _create(podctl, srv, pub, "--volume", "rovol") == 1
         assert "the volume pins the data centre" in capsys.readouterr().out
@@ -1836,6 +2108,105 @@ def test_unit_runpod_cuda_floor_comes_from_the_flag_or_the_image_tag():
         podctl.allowed_cuda("14.0")
 
 
+def test_unit_runpod_create_sends_no_cuda_list_and_holds_the_placed_pod_to_the_floor(tmp_path):
+    """3.29.0 (RunPod's docs, read 2026-10-26): allowedCudaVersions matches EXACTLY, REST v1's enum stops at 13.0, and
+    every B200, B300 and RTX PRO 6000 host with stock reports 13.2, so ["13.0"] could never place one. create sends no
+    list (any CUDA), then reads the pod's cudaVersion from REST v2 GET /pods/{id} (null for a few seconds, so asked
+    again for about 60 s) and holds it to the floor: 13.2 passes a 13.0 floor; 12.8, or no version at all, is a STOP
+    and the pod is STOPPED, never deleted, and a network volume the call made stays with it."""
+    podctl = _load()
+    srv = FakeRunPod(_pod(), gql=B200_STOCK)
+    api = podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql")
+    slept = []
+    def make(**kw):
+        said = []
+        try:
+            pid = podctl.create(api, "c1", "NVIDIA B200", "EU-RO-1", data_gb=50, image="runpod/comfyui:1.4.7-cuda13.0",
+                                pubkey="ssh-ed25519 K k", wait=False, sleep=slept.append, say=said.append, name_ports=False, **kw)
+        except podctl.PodctlError as e:
+            return None, said, str(e)
+        return pid, said, None
+    try:
+        pid, said, err = make()
+        body = [b for p, b in srv.bodies if p == "/pods"][-1]
+        assert err is None and pid == "newpod0000001" and "allowedCudaVersions" not in body, (err, body)
+        assert srv.v2_pod_reads == ["newpod0000001"] and slept == [], (srv.v2_pod_reads, slept)
+        assert any("cuda     13.2 on the host (floor 13.0)" in l for l in said), said
+        assert not any(p.endswith("/stop") for p in srv.posts) and srv.pod["desiredStatus"] == "RUNNING"
+        # null for the first reads, then 13.2: asked again, every 5 s, and passed
+        srv.v2_cuda = [None, None, "13.2"]; srv.v2_pod_reads.clear()
+        pid, said, err = make()
+        assert err is None and len(srv.v2_pod_reads) == 3 and slept == [5, 5], (err, srv.v2_pod_reads, slept)
+        # a 12.8 host under the 13.0 floor: STOPPED (never deleted), a STOP line with both versions, PodctlError
+        srv.v2_cuda = ["12.8"]; slept.clear()
+        pid, said, err = make()
+        assert err and "12.8" in err and "13.0" in err, err
+        stop = [l for l in said if l.startswith("STOP:")]
+        assert len(stop) == 1 and "newpod0000001 stopped" in stop[0] and "CUDA 12.8, below the floor 13.0" in stop[0], said
+        assert srv.posts[-1] == "/pods/newpod0000001/stop" and srv.pod["desiredStatus"] == "EXITED", srv.posts
+        assert srv.deletes == [], "a refused pod is stopped, never deleted, and the volume it is on stays"
+        # an explicit --min-cuda is the floor: 12.8 passes 12.8
+        srv.pod["desiredStatus"] = "RUNNING"
+        pid, said, err = make(min_cuda="12.8")
+        assert err is None and any("cuda     12.8 on the host (floor 12.8)" in l for l in said), (err, said)
+        # never named in about 60 s (12 reads, 5 s apart): refused the same way, and said why
+        srv.v2_cuda = [None]; srv.v2_pod_reads.clear(); slept.clear()
+        pid, said, err = make()
+        assert err and "no CUDA version" in err and len(srv.v2_pod_reads) == 12 and slept == [5] * 11, (err, slept)
+        assert srv.posts[-1] == "/pods/newpod0000001/stop" and srv.deletes == []
+        assert any(l.startswith("STOP:") and "could not be checked" in l for l in said), said
+        # --private takes the same check
+        srv.v2_cuda = ["12.8"]; srv.pod["desiredStatus"] = "RUNNING"
+        pid, said, err = make(private=True)
+        assert err and srv.posts[-1] == "/pods/newpod0000001/stop" and srv.deletes == [], (err, srv.posts)
+        assert "allowedCudaVersions" not in [b for p, b in srv.bodies if p == "/pods"][-1]
+        with pytest.raises(podctl.PodctlError):                      # a --min-cuda that is no version: refused first
+            podctl.create(api, "c2", "NVIDIA B200", "EU-RO-1", data_gb=50, image="x/y:cu130", pubkey="k", wait=False,
+                          min_cuda="thirteen", say=lambda *a: None)
+    finally:
+        srv.close()
+    assert podctl.cuda_at_least("13.2", "13.0") and podctl.cuda_at_least("13.0", "13.0") and podctl.cuda_at_least("12.11", "12.2")
+    assert not podctl.cuda_at_least("12.8", "13.0") and not podctl.cuda_at_least(None, "13.0") and podctl.cuda_at_least(None, None)
+    assert podctl.cuda_key("13.2") == (13, 2)
+
+
+def test_unit_runpod_create_stock_reads_the_v2_catalog_at_the_cuda_floor(tmp_path):
+    """3.29.0: GraphQL's stock view has no CUDA input, so it said "free" for a B200 whose only hosts could not take the
+    create. With create's floor (the image and --min-cuda), availability asks REST v2 GET /catalog/gpus with
+    include=AVAILABILITY, product=POD, cloud=SECURE and minCudaVersion, keeps the data centres whose availability is not
+    NONE, and still leaves out one POST /pods does not take and, for a network volume, one without storage support."""
+    podctl = _load()
+    srv = FakeRunPod(_pod(), gql=B200_STOCK)
+    prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+    try:
+        assert prov.availability("NVIDIA B200", image="runpod/comfyui:1.4.7-cuda13.0") == ["EU-RO-1", "US-CA-2"]
+        assert srv.catalog_queries[-1] == {"include": "AVAILABILITY", "product": "POD", "cloud": "SECURE", "minCudaVersion": "13.0"}
+        assert srv.posts == [], "no volume wanted: the catalog alone, no GraphQL"
+        # hosts below the floor only: GraphQL still says free, the catalog says NONE, so nowhere
+        srv.catalog_cuda = "12.8"
+        assert podctl.stock(prov.api, "NVIDIA B200") and prov.availability("NVIDIA B200", image="x/y:cu130") == []
+        assert prov.availability("NVIDIA B200", image="x/y:cu130", min_cuda="12.8") == ["EU-RO-1", "US-CA-2"]
+        assert srv.catalog_queries[-1]["minCudaVersion"] == "12.8"
+        # the catalog's own order and words; NONE left out; a data centre create cannot take, and (volume) one with no
+        # network volumes, are named in skipped
+        srv.catalog = {"gpus": [{"id": "NVIDIA H200", "availability": "HIGH", "dataCenters": [{"id": "EU-RO-1", "name": "x", "availability": "HIGH"}]},
+                                {"id": "NVIDIA B200", "availability": "LOW", "dataCenters": [
+                                    {"id": "US-NC-2", "name": "NC 2", "availability": "LOW"},
+                                    {"id": "US-CA-2", "name": "CA 2", "availability": "MEDIUM"},
+                                    {"id": "EU-RO-1", "name": "RO 1", "availability": "NONE"},
+                                    {"id": "US-KS-2", "name": "KS 2", "availability": "LOW"}]}]}
+        srv.gql = {"dataCenters": [{"id": "US-KS-2", "storageSupport": False, "gpuAvailability": []}]}
+        skipped = []
+        assert podctl.stock(prov.api, "NVIDIA B200", floor="13.0", skipped=skipped) == [("US-CA-2", "Medium"), ("US-KS-2", "Low")]
+        assert skipped == [("US-NC-2", "RunPod's create API does not take this data centre")], skipped
+        skipped = []
+        assert podctl.stock(prov.api, "NVIDIA B200", volume=True, floor="13.0", skipped=skipped) == [("US-CA-2", "Medium")]
+        assert ("US-KS-2", "no network volumes here") in skipped and "/graphql" in srv.posts, skipped
+        assert podctl.catalog_stock(prov.api, "NVIDIA B300 SXM6 AC", "13.0") == []
+    finally:
+        srv.close()
+
+
 def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor(tmp_path, capsys):
     """3.8.0, Paul's decision of 2026-10-16: the video packages run on B200 first and B300 second, so `create` without
     --gpu asks for "NVIDIA B200", then "NVIDIA B300 SXM6 AC" (never the 34 GB MIG slice), and takes the first with stock
@@ -1858,7 +2229,8 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
         out = capsys.readouterr().out
         body = srv.bodies[-1][1]
         assert body["gpuTypeIds"] == ["NVIDIA B200"] and body["dataCenterIds"] == ["EU-RO-1"], body
-        assert body["allowedCudaVersions"] == ["13.0"], "a cu128 image tag must not lower the floor below the base's cu130"
+        assert "allowedCudaVersions" not in body                                        # 3.29.0: no list; the floor is checked
+        assert srv.catalog_queries[-1]["minCudaVersion"] == "13.0", "a cu128 image tag must not lower the floor below the base's cu130"
         assert "gpu     NVIDIA B200, in EU-RO-1 (no --gpu: the host's order is %s)" % ", ".join(podctl.RunPodProvider.default_gpus) in out, out
         # the volume pins EUR-IS-1, which has no B200: the B300 there
         assert create("--volume", "isvol") in (None, 0)
@@ -1874,7 +2246,8 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
         assert [p for p, _ in srv.bodies[n:] if p != "/graphql"] == [], "a STOP creates no volume and no pod"
         # an explicit --gpu is the only one asked; an explicit --min-cuda still wins over the floor
         assert create("--data-gb", "100", "--gpu", "NVIDIA B300 SXM6 AC", "--min-cuda", "12.9") in (None, 0)
-        assert srv.bodies[-1][1]["gpuTypeIds"] == ["NVIDIA B300 SXM6 AC"] and srv.bodies[-1][1]["allowedCudaVersions"] == ["13.0", "12.9"]
+        assert srv.bodies[-1][1]["gpuTypeIds"] == ["NVIDIA B300 SXM6 AC"] and "allowedCudaVersions" not in srv.bodies[-1][1]
+        assert srv.catalog_queries[-1]["minCudaVersion"] == "12.9"
     finally:
         srv.close()
     assert podctl.create_floor("someone/comfy:latest") == "13.0" and podctl.create_floor("runpod/comfyui:1.4.7-cuda13.0") == "13.0"
@@ -2120,7 +2493,7 @@ def test_unit_runpod_create_private_is_an_unencrypted_pod_volume_behind_ssh_only
         assert "drop --private" in str(e.value) and srv.posts == [] and srv.gets == []
         assert _create(podctl, srv, pub, "--private", "--data-gb", "200") in (None, 0)
         out = capsys.readouterr().out
-        assert srv.posts == ["/graphql", "/graphql", "/pods"], srv.posts       # no network volume is made (3.20.0: the price read)
+        assert srv.posts == ["/graphql", "/pods"], srv.posts       # no network volume is made (3.20.0: the price read; 3.29.0: the stock is the v2 catalog, a GET)
         body = srv.bodies[-1][1]
         assert "networkVolumeId" not in body and body["volumeInGb"] == 200 and "volumeEncrypted" not in body, body
         assert set(body) <= POD_CREATE_INPUT, sorted(set(body) - POD_CREATE_INPUT)

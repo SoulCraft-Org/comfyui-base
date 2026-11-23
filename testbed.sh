@@ -42,7 +42,7 @@
 #    failing to load the graph.
 #  ✔ server (--server): the pure-Python packs import and register under a
 #    current Python, and /object_info answers. On Linux triton sits beside the
-#    CPU torch (3.22.1), so packs that import it at module level register too.
+#    CPU torch (3.30.7), so packs that import it at module level register too.
 #  ✘ CUDA: this host has no NVIDIA GPU. SolAttn (Triton), the Nvidia RTX nodes
 #    and the int8-ConvRot loader (comfy-kitchen) cannot import here.
 #  ✘ rendering: needs the weights and an sm_120 GPU. That is the pod.
@@ -283,17 +283,34 @@ _venv_minor(){ "$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_in
 # Newest first, each minor asked whether the torch family resolves on it (a cached resolve, no install), the first
 # yes wins: still "always the newest", only the newest that works. The pod does the same in lib/30-venv.sh
 # (_base_python_pick, against the whole derived set, since 3.6.1). Stable minors only: the pattern skips 3.16.0a1 and +freethreaded.
+# 3.30.5: torch is not the only thing that lags. Once ComfyUI and the packs are on disk, every minor torch resolves on
+# is also asked how many of their requirement files install from wheels alone (--no-build), and the minor with the
+# most wins, the newer one on a tie. On 2026-11-22 torch had cp315 wheels but onnxruntime had none (Easy-Use, RMBG,
+# controlnet_aux need it) and kornia-rs none either, so 3.15 lost those packs' nodes and 3.14 installs them (issue #71).
+# CUDA-only packs fail on every minor alike, so they never decide. With no requirement files the first torch yes wins.
 _testbed_python_pick(){ # → x.y on stdout; why on stderr
-  local cands mm tmp="${TMPDIR:-/tmp}/testbed-pick.$$.txt" have
+  local cands mm tmp="${TMPDIR:-/tmp}/testbed-pick.$$.txt" have row dir f n best="" bestn=-1 reqs=() back=()
   cands="$(uv python list 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV || true)"
   [ -n "$cands" ] || { warn "uv lists no CPython: cannot pick a Python" >&2; return 1; }
+  [ -f "$COMFY/requirements.txt" ] && reqs+=("$COMFY/requirements.txt")
+  for row in ${PACKS[@]+"${PACKS[@]}"}; do
+    dir="${row%%|*}"; [ -f "$CN/$dir/requirements.txt" ] && reqs+=("$CN/$dir/requirements.txt")
+  done
+  [ "$(uname -s)" = Linux ] && back=(--torch-backend cpu)                # what the install below draws from
   for mm in $cands; do
-    if printf 'torch\ntorchvision\ntorchaudio\n' | uv pip compile --quiet --python-version "$mm" - -o "$tmp" >/dev/null 2>&1; then
-      rm -f "$tmp"; echo "$mm"; return 0
+    if ! printf 'torch\ntorchvision\ntorchaudio\n' | uv pip compile --quiet --python-version "$mm" - -o "$tmp" >/dev/null 2>&1; then
+      note "Python $mm: torch has no build for it yet, trying the next" >&2; continue
     fi
-    note "Python $mm: torch has no build for it yet, trying the next" >&2
+    [ "${#reqs[@]}" -gt 0 ] || { rm -f "$tmp"; echo "$mm"; return 0; }
+    n=0
+    for f in "${reqs[@]}"; do
+      uv pip compile --quiet --no-build ${back[@]+"${back[@]}"} --python-version "$mm" "$f" -o "$tmp" >/dev/null 2>&1 && n=$((n + 1))
+    done
+    note "Python $mm: $n of ${#reqs[@]} requirement files install from wheels" >&2
+    if [ "$n" -gt "$bestn" ]; then best="$mm"; bestn="$n"; fi
   done
   rm -f "$tmp"
+  [ -z "$best" ] || { echo "$best"; return 0; }
   # nothing resolves (offline, or the index is down): keep a venv that runs rather than tear it down for a guess
   have="$(_venv_minor)"
   local keep="trying the newest"; [ -z "$have" ] || keep="keeping the venv's Python $have"
@@ -316,7 +333,7 @@ _testbed_venv(){ # <x.y>
   fi
 }
 
-# 3.22.1: triton beside the CPU torch, on Linux. A pod's CUDA torch carries it (lib/30-venv.sh keeps it in the torch
+# 3.30.7: triton beside the CPU torch, on Linux. A pod's CUDA torch carries it (lib/30-venv.sh keeps it in the torch
 # family) and the CPU build does not, while packs import it at module level: ComfyUI-RMBG's HEAD (229529e, 2026-10-17)
 # bundles a sam3 whose edt.py does `import triton`, the pack's loader then raises a NameError in its own except branch
 # and none of its nodes register, and ComfyUI-Easy-Sam3 stops on "No module named 'triton'". Importing it needs no GPU
@@ -335,6 +352,19 @@ _testbed_triton(){
   fi
 }
 
+# 3.30.4: an install the server cannot start without (torch, ComfyUI's own requirements) prints uv's own error when it
+# fails. Both used to go to /dev/null, so on CI a failed resolve surfaced only as the server's later
+# "No module named 'comfy_aimdo'", with the cause gone (every package gate since 2026-11-02).
+_uv_shown(){ # <what> <uv command…> → uv's status; on failure the last 25 lines of its output
+  local what="$1" log="${TMPDIR:-/tmp}/testbed-uv.$$.log" rc=0; shift
+  "$@" >"$log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "$what: uv exited $rc. Its output:"
+    tail -n 25 "$log" | sed 's/^/      /'
+  fi
+  rm -f "$log"; return "$rc"
+}
+
 provision_server() {
   hdr "VENV + SERVER (CPU)"
   command -v uv >/dev/null || { warn "uv is not installed — needed to build the venv"; return 1; }
@@ -348,7 +378,7 @@ provision_server() {
   # and the pod's install (lib/30-venv.sh) chooses its own backend: neither changes.
   if [ "$(uname -s)" = Linux ]; then export UV_TORCH_BACKEND=cpu; fi
   note "installing torch (CPU${UV_TORCH_BACKEND:+, uv --torch-backend $UV_TORCH_BACKEND}) + every requirement at its newest: this is the slow part …"
-  uv pip install -q --upgrade --python "$VENV/bin/python" torch torchvision torchaudio >/dev/null
+  _uv_shown "torch" uv pip install -q --upgrade --python "$VENV/bin/python" torch torchvision torchaudio
   if [ "$(uname -s)" = Linux ]; then _testbed_triton; fi
   # one pin-free set: ComfyUI's own == pins (its frontend packages) and every pack's are lifted by the base's reqlift
   local row dir files=("ComfyUI=$COMFY/requirements.txt") derived="$COMFY/.testbed-derived.txt"   # inside the ignored testbed tree
@@ -362,7 +392,12 @@ provision_server() {
     else
       # best effort on a Mac: several packs are CUDA-only and will not resolve here; install what does, pack by pack
       warn "the full set does not resolve on this host (expected for CUDA-only packs): installing it pack by pack"
-      uv pip install -q --upgrade --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest >/dev/null 2>&1 || true
+      # 3.30.4: wheels first. On a Python newer than a dependency's wheels uv builds that dependency from source, and one
+      # failed build sinks the whole set: kornia-rs (kornia >= 0.8) has no cp315 wheel and needs cmake, so on CPython 3.15
+      # ComfyUI's install died and the server could not import comfy_aimdo (issue #71). --no-build takes the newest version
+      # that has a wheel (kornia 0.7.1 there); a set that cannot resolve that way installs as before.
+      _uv_shown "ComfyUI's own requirements (wheels only)" uv pip install -q --upgrade --no-build --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest \
+        || _uv_shown "ComfyUI's own requirements" uv pip install -q --upgrade --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest || true
       local f
       for f in "${files[@]}"; do
         uv run --no-project --quiet --with packaging python "$REQLIFT" --out "$derived.one" --map /dev/null "$f" >/dev/null 2>&1 || continue
@@ -442,7 +477,7 @@ status() {
   hdr "STATUS"
   [ -d "$COMFY/.git" ] && ok "ComfyUI $(git -C "$COMFY" describe --tags 2>/dev/null || echo '?') · $(ls -1 "$CN" 2>/dev/null | wc -l | tr -d ' ') packs" || note "no source tree yet"
   [ -x "$VENV/bin/python" ] && ok "venv $($VENV/bin/python -V 2>&1)" || note "no venv"
-  if [ -x "$VENV/bin/python" ] && [ "$(uname -s)" = Linux ]; then   # 3.22.1: _testbed_triton; macOS has none to show
+  if [ -x "$VENV/bin/python" ] && [ "$(uname -s)" = Linux ]; then   # 3.30.7: _testbed_triton; macOS has none to show
     local tri; tri="$("$VENV/bin/python" -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || true)"
     if [ -n "$tri" ]; then ok "triton $tri"; else warn "no triton in the venv: packs that import it at module level do not register (--server installs it)"; fi
   fi
@@ -450,7 +485,7 @@ status() {
   if mine="$(owned_server 2>/dev/null)"; then ok "server answering at $mine (this testbed's, pid $(own_pids | head -1))"
   elif curl -fsS "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then note "a server answers on $PORT, but not this testbed's (TESTBED_PORT picks another)"
   else note "server not running"; fi
-  # 3.22.1: the packs this server could not import, from ComfyUI's own "Import times for custom nodes" in its log. A suite
+  # 3.30.7: the packs this server could not import, from ComfyUI's own "Import times for custom nodes" in its log. A suite
   # passes around a pack that never registered (ComfyUI-RMBG without triton did, image-creator-krea-2 CI run 39078526395),
   # so the CI log names them instead
   if [ -n "${mine:-}" ] && [ -f "$LOG" ] && grep -q "Import times for custom nodes" "$LOG"; then

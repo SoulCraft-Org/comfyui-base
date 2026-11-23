@@ -18,7 +18,7 @@ from pathlib import Path
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1] / "py"))
-from canvas import structure_sha, CHROME_LEFT, CHROME_TOP, FRONTEND_ONLY_TYPES, load_spec, package_files              # noqa: E402
+from canvas import structure_sha, CHROME_LEFT, CHROME_TOP, FRONTEND_ONLY_TYPES, load_spec, package_files, text_host             # noqa: E402
 from comfy_settings import SEED                                                                                      # noqa: E402
 
 
@@ -242,7 +242,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pkg", default=os.environ.get("BASE_PKG", os.getcwd()), help="the package folder (default: the cwd)")
     ap.add_argument("--wf", default=None, help="the workflow (default: the package's '* Workflow.json', or $BASE_WF)")
-    ap.add_argument("--server", default=os.environ.get("BASE_SERVER") or "127.0.0.1:8199")
+    ap.add_argument("--server", default=os.environ.get("BASE_SERVER") or f"127.0.0.1:{os.environ.get('TESTBED_PORT') or 8199}")
     ap.add_argument("--out", default=None, help="default <pkg>/_build/snapshots")
     ap.add_argument("--sizes-out", default=None, help="default <pkg>/_build/sizes.json")
     ap.add_argument("--viewport", action="append", help="WxH@dpr, repeatable; default CANVAS.display")
@@ -347,6 +347,8 @@ def main():
         Path(a.sizes_out).write_text(json.dumps(
                   {"frontend": view["frontend"], "comfyui": view["comfyui"], "generated": view["generated"],
                    "platform": sys.platform,       # 3.8.2: the text metrics differ by OS; the cache is compared only where it was made
+                   # 3.27.2: and by machine and fonts (py/canvas.py text_host): a Blacksmith ARM runner measured 17 nodes otherwise
+                   "machine": text_host()["machine"], "fonts": text_host()["fonts"],
                    "workflow_structure_sha": view["workflow_structure_sha"],
                    "constants": {"NODE_TITLE_HEIGHT": 30, "NODE_SLOT_HEIGHT": 20, "NODE_WIDGET_HEIGHT": 20},
                    "nodes": sizes}, indent=1, ensure_ascii=False))

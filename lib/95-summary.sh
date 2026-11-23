@@ -21,6 +21,13 @@ _base_validate_tables(){ # every required declaration present and every table ro
     local gp; gp="$("$SYS_PY" "$BASE_DIR/py/gpu_fit.py" --check "$GPU_PREFER" 2>&1)" || { echo "  !! GPU_PREFER: $gp" >&2; bad=1; }
   fi
   _base_launch_env_rows >/dev/null || bad=1   # 3.10.0: LAUNCH_ENV, refused here, before anything downloads
+  local hrow                              # 3.28.0: a --cache-ram row carries one or two numbers of GB, as the flag takes
+  for hrow in ${HYGIENE_ARGS[@]+"${HYGIENE_ARGS[@]}"}; do
+    case "$hrow" in --cache-ram|"--cache-ram "*) ;; *) continue ;; esac
+    if ! _base_cache_ram_ok "$(printf '%s' "${hrow#--cache-ram}" | awk '{$1=$1; print}')"; then
+      echo "  !! HYGIENE_ARGS '$hrow': --cache-ram takes one or two numbers of GB (the active, then the inactive cache's headroom)" >&2; bad=1
+    fi
+  done
   return $bad
 }
 _base_declare_dump(){ # BASE_DECLARE_ONLY=1: the validated tables, one row per line, for list-packs / gen-models / suites
@@ -44,8 +51,15 @@ _base_hook(){ # run a package hook if the package defines it; a failing hook fai
 base_init(){
   base_env_setup
   _base_logging
+  ! _base_runtime_on || _base_runtime_pin_tree     # 3.30.2: the runtime's tree, never another one on the volume
   local drc=0; base_discover quiet || drc=$?
   if [ "$drc" = 3 ]; then base_discover || true; exit 3; fi             # no network volume: the refusal, printed
+  BASE_RUNTIME_PENDING=0
+  if _base_runtime_on && _base_runtime_pending_check; then               # 3.30.1: the runtime is still unpacking; the tree is read after it
+    if ! _base_validate_tables; then err "the package's declarations are invalid (see above)"; exit 2; fi
+    _base_runtime_init; _base_runtime_pretree; _base_tmp
+    return 0
+  fi
   if [ "$drc" = 4 ] && _base_runtime_on; then err "runtime mode and no ComfyUI tree: run 'runtime-apply <manifest>' first"; exit 3; fi
   if [ "$drc" = 4 ]; then                                               # a volume without a ComfyUI tree: make one
     local mrc=0; base_comfy_materialize || mrc=$?
@@ -93,7 +107,13 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
   local nfail="${#BASE_FAILED[@]}"      # the OS stage may have recorded a failure that does not stop the run; tokens are judged alone
   base_tokens || true
   if [ "${#BASE_FAILED[@]}" -gt "$nfail" ]; then err "a token was rejected: stopping before anything downloads"; base_summary; fi
+  # 3.28.0: the model downloads start here, before the ComfyUI fetch and the pack clones, when no file of the first set lives
+  # inside a pack and uv can be had now (lib/52-models-early.sh _base_early_first); else after them, below, as before
+  if ! _base_runtime_on && _base_early_first "$sysbg"; then _base_models_early_start || true; fi
   if _base_runtime_on; then            # 3.1.0: the tree, the packs and the venv are the runtime's, checked, never moved
+    # 3.30.1: the first set of models starts now, beside the unpack when it is still running; only the tree waits for it
+    if _base_runtime_early_ok && _base_early_first 0; then _base_models_early_start || true; fi
+    if [ "${BASE_RUNTIME_PENDING:-0}" = 1 ]; then if ! _base_runtime_wait_apply; then base_summary; fi; fi
     if ! _base_runtime_comfy; then base_summary; fi
   else base_update_comfyui || true; fi
   if ! base_comfy_gate; then base_summary; fi
@@ -113,7 +133,7 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
     if [ "$src" = 10 ]; then base_summary; fi
     if ! _base_driver_gate; then base_summary; fi
   fi
-  _base_models_early_start || true     # 3.11.0: the model downloads run beside everything from here to the model stage
+  _base_models_early_start || true     # 3.11.0: the model downloads run beside everything from here to the model stage (3.28.0: unless already started above)
   _base_tools_start || true            # 3.11.0: and JupyterLab's tools venv, joined at the BOOT stage
   _base_cuda_toolchain_start || true   # 3.22.0: and the cuBLAS probe with its apt install (lib/40-packs.sh)
   base_venv_snapshot                   # 3.0.0: the venv before this run changed any of it (the core rollback's source)
@@ -139,14 +159,17 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
     base_summary
   fi
   _base_hook pkg_pre_models
+  _base_launch_early || true           # 3.27.0: a first install starts ComfyUI here, beside the downloads (lib/80-server.sh)
   _base_models_early_join || true      # 3.11.0: the early downloads, waited for and folded in; the model stage still judges every row
   base_models || true
   base_prune || true
   base_sync || true
   _base_hook pkg_post_models
-  base_import_check || true
-  _base_own_packs_judge "${BASE_TMPD:-/nonexistent}/import_check.log" || true   # 3.2.0: an own pack that does not import is put back
-  base_hygiene || true
+  if [ "${BASE_EARLY_DONE:-0}" != "1" ]; then   # 3.27.0: an early start ran these just before it
+    base_import_check || true
+    _base_own_packs_judge "${BASE_TMPD:-/nonexistent}/import_check.log" || true   # 3.2.0: an own pack that does not import is put back
+    base_hygiene || true
+  fi
   base_boot_install || true
   base_ledger_write || true
   base_restart || true
@@ -233,10 +256,14 @@ base_test(){ # [tier] — the package's suite.py beside the script (the base's o
     case "$_v" in BASE_WF|BASE_SCRIPT|BASE_PKG_DIR|BASE_LIB|BASE_COMFY|BASE_VENV|BASE_STATE|BASE_MODELS_DIR|BASE_NODE_SRC|BASE_SERVER|BASE_ON_POD|BASE_WORKSPACE|BASE_SKIPPED_OUT|BASE_ONLY_IDS) ;; *) _scrub+=(-u "$_v");; esac
   done
   local _errexit=0; case $- in *e*) _errexit=1;; esac; set +e      # pytest's OWN status, whatever the shell's options (2.0.14: tee's 0 once read as green)
+  # 3.22.1: -rfEs names every failed and errored test in the short summary (-rs named only the skips). The `&& … || …`
+  # keeps a red suite under pipefail from tripping the ERR trap that `set -E` carries in here (it blamed tee and ended the
+  # run, exit 4), and reads pytest's status with or without pipefail: `|| rc=` alone would read tee's 0 without it
+  rc=0
   PYTHONPATH="$BASE_DIR/py${PYTHONPATH:+:$PYTHONPATH}" BASE_WF="${PKG_DIR:-}/${WF_NAME:-}" BASE_SCRIPT="${PKG_SCRIPT:-}" BASE_PKG_DIR="${PKG_DIR:-}" BASE_LIB="$BASE_DIR" \
      BASE_COMFY="${COMFY:-}" BASE_VENV="${VENV:-}" BASE_STATE="${BASE_STATE:-}" BASE_MODELS_DIR="${M:-}" BASE_NODE_SRC="${BASE_NODE_SRC:-}" BASE_SERVER="${BASE_SERVER:-}" BASE_ON_POD="$on_pod" \
      env ${_scrub[@]+"${_scrub[@]}"} -u HF_TOKEN -u HF_HUB_TOKEN -u HUGGING_FACE_HUB_TOKEN -u HUGGINGFACE_API_KEY -u CIVITAI_TOKEN -u CIVITAI_API_KEY -u CIVITAI_API_TOKEN \
-     "${runner[@]}" -q -rs -p no:cacheprovider -p basetest ${cargs[@]+"${cargs[@]}"} "$suite" ${mexpr:+-m "$mexpr"} 2>&1 | tee "$out"; rc="${PIPESTATUS[0]}"
+     "${runner[@]}" -q -rfEs -p no:cacheprovider -p basetest ${cargs[@]+"${cargs[@]}"} "$suite" ${mexpr:+-m "$mexpr"} 2>&1 | tee "$out" && rc="${PIPESTATUS[0]}" || rc="${PIPESTATUS[0]}"
   [ "$_errexit" = 1 ] && set -e; true
   BASE_TEST_TABLE="$(awk '/= test tiers =/{f=1;next} f&&/^=+/{exit} f' "$out" || true)"
   BASE_TEST_RESULT="$(grep -E '^[0-9]+ (passed|failed)|no tests ran|error' "$out" | tail -1 || true)"; BASE_TEST_RESULT="${BASE_TEST_RESULT:-exit $rc}"
@@ -286,6 +313,7 @@ HLP
 
 _base_list(){ local x; for x in "$@"; do echo "      • $x"; done; }
 base_summary(){ # one screen; exits 0, or 1 when anything is in BASE_FAILED. Always the last step.
+  if declare -F _base_early_abandon >/dev/null; then _base_early_abandon; fi   # 3.27.0: a run stopped before its restart
   local tag=""; [ "$BASE_DRY" = "1" ] && tag=" (dry run — nothing was changed)"
   hdr "SUMMARY · ${PKG_NAME:-ComfyUI Base} V${PKG_VERSION:-$BASE_VERSION} · base $BASE_VERSION$tag"
   echo "  venv       ${VENV:-?} → $BASE_VENV_RESULT"

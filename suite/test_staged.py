@@ -133,6 +133,21 @@ def test_unit_fetch_later_replaces_every_stand_in_and_empties_the_list(tmp_path)
     assert doc["stage"] == "done" and all(f["state"] == "present" for f in doc["files"])
 
 
+def test_unit_fetch_later_hands_its_queue_over_smallest_first(tmp_path):
+    """3.28.0: fetch-later's pending files go to the download queue by size, smallest first (equal sizes keep the queue's
+    order), and the queue is told to start them that way (_BASE_FETCH_SMALL_FIRST=1). The install's own queue is untouched."""
+    c = _pod(tmp_path)
+    state = tmp_path / "comfy-base/state"; state.mkdir(parents=True)
+    rows = [("big", 8192), ("small", 1024), ("mid", 4096), ("tiny", 1024)]
+    (state / "later.queue").write_text("".join("FILE|vae/Example/Real/%s.safetensors|https://huggingface.co/x/y/resolve/main/%s.safetensors|%d|%s\n"
+                                               % (n, n, b, c / "models" / ("vae/Example/Real/%s.safetensors" % n)) for n, b in rows))
+    r = _bash('_base_fetch_queue(){ local s; for s in "$@"; do IFS="|" read -r _ s _ <<<"$s"; echo "Q $s"; done; echo "SMALL=${_BASE_FETCH_SMALL_FIRST:-0}"; }; '
+              'base_fetch_later; echo "AFTER=${_BASE_FETCH_SMALL_FIRST:-unset}"', env=_fake(tmp_path, BASE_FAKE_FREE_GB="500"))
+    got = [l.split()[1].split("/")[-1] for l in r.stdout.splitlines() if l.startswith("Q ")]
+    assert got[:4] == ["small.safetensors", "tiny.safetensors", "mid.safetensors", "big.safetensors"], r.stdout + r.stderr
+    assert "SMALL=1" in r.stdout and "AFTER=unset" in r.stdout, r.stdout                 # local to fetch-later: nothing leaks
+
+
 def test_unit_fetch_later_refuses_while_another_live_one_runs(tmp_path):
     _pod(tmp_path)
     state = tmp_path / "comfy-base/state"; state.mkdir(parents=True)
@@ -246,7 +261,9 @@ def test_unit_comfyui_is_told_where_the_base_keeps_its_state():
     alike) exports it, from BASE_STATE in an install and from BASE_HOME in the boot."""
     body = (BASE / "lib" / "85-launch.sh").read_text()
     whole = body[body.index("_base_start_comfy(){"):]
-    assert "_base_spawn_server" in whole[:whole.index("\n}\n")], "3.20.0: _base_start_comfy starts each server through _base_spawn_server"
+    assert "_base_spawn_comfy" in whole[:whole.index("\n}\n")], "3.27.0: _base_start_comfy is the spawn, then the wait"
+    whole = body[body.index("_base_spawn_comfy(){"):]
+    assert "_base_spawn_server" in whole[:whole.index("\n}\n")], "3.20.0: the start runs each server through _base_spawn_server"
     start = body[body.index("_base_spawn_server(){"):]
     start = start[:start.index("\n}\n")]
     assert 'export COMFY_BASE_STATE="$_cbs"' in start and '${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}' in start

@@ -4,8 +4,8 @@ A buyer's machine installs what its maintainer's own sweep proved: ComfyUI, the 
 venv and the wheel cache, as parts with a manifest that is the ONLY place their versions are written. These tests build
 a runtime from a fake green tree, apply it to a fresh one, and install the stub package from it with every fetching tool
 stubbed to fail loudly if it is ever called to fetch."""
-import json, os, pathlib, shutil, subprocess, tarfile, pytest
-pytestmark = pytest.mark.unit
+import functools, http.server, importlib.util, json, os, pathlib, random, shutil, subprocess, tarfile, threading, time, pytest
+pytestmark = [pytest.mark.unit, pytest.mark.skipif(not shutil.which("zstd"), reason="the runtime's parts are zstd tars: the machine needs zstd (CI has it)")]
 BASE = pathlib.Path(__file__).resolve().parents[1]
 RT = BASE / "py" / "runtime.py"
 
@@ -25,7 +25,7 @@ def _repo(d, url=None):
     return _git(d, "rev-parse", "HEAD")
 
 
-FAKE_PY = '#!/bin/bash\ncase "$*" in *"import torch"*) echo "2.99.0 13.0";; *"import sageattention"*) exit 0;; *platform.python_version*) echo "3.99.0";; *) exec python3 "$@";; esac\n'
+FAKE_PY = '#!/bin/bash\ncase "$*" in *"print(torch.version.cuda"*) echo "13.0";; *"import torch"*) echo "2.99.0 13.0";; *"import sageattention"*) exit 0;; *platform.python_version*) echo "3.99.0";; *) exec python3 "$@";; esac\n'
 
 
 def _green_tree(root):
@@ -60,31 +60,39 @@ def _green_tree(root):
     return c
 
 
-def _build(root, out, part_bytes=None):
+def _build(root, out, part_bytes=None, apt=None):
     args = ["python3", str(RT), "build", "--root", str(root), "--comfy", str(root / "ComfyUI"), "--out", str(out),
-            "--driver-min", "580", "--base-version", "9.9.9", "--python", "3.99.0", "--sage-key", "sageattention-abc-cp399-torch2.99.0-sm_120"]
+            "--torch-cuda", "13.0", "--base-version", "9.9.9", "--python", "3.99.0", "--sage-key", "sageattention-abc-cp399-torch2.99.0-sm_120"]
     if part_bytes:
         args += ["--part-bytes", str(part_bytes)]
+    if apt:
+        args += ["--apt", apt]
     r = subprocess.run(args, capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     return json.loads((out / "runtime.json").read_text())
 
 
-def _names(out, man):
-    data = b"".join((out / p["name"]).read_bytes() for p in man["parts"])
-    tmp = out / "joined.tar.gz"; tmp.write_bytes(data)
+def _part_names(path):
+    z = subprocess.run(["zstd", "-dc", "-q", str(path)], capture_output=True, check=True)
+    tmp = path.with_suffix(".tar")
+    tmp.write_bytes(z.stdout)
     with tarfile.open(tmp) as t:
         names = t.getnames()
     tmp.unlink()
     return names
 
 
+def _names(out, man):
+    return [n for p in man["parts"] for n in _part_names(out / p["name"])]
+
+
 # ---------------------------------------------------------------- py/runtime.py
 
 def test_unit_a_runtime_carries_code_never_data_or_secrets(tmp_path):
     src = tmp_path / "src"; _green_tree(src)
-    out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
-    assert len(man["parts"]) > 1 and all(p["bytes"] <= 700 for p in man["parts"])
+    out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
+    assert len(man["parts"]) > 1 and man["format"] == 3 and man["compression"] == "zstd" and man["files"] == []
+    assert all(p["name"].endswith(".tar.zst") and len(p["sha256"]) == 64 and p["bytes"] > 0 for p in man["parts"])
     names = _names(out, man)
     assert "ComfyUI/main.py" in names and "ComfyUI/custom_nodes/PackA/README" in names and "ComfyUI/.venv-cu130/bin/python" in names
     assert "comfy-base/tools" in names and "comfy-base/tools.3.99.1/bin/jupyter-lab" in names and "comfy-base/state/wheels/sageattention-abc/s.whl" in names
@@ -97,8 +105,172 @@ def test_unit_a_runtime_carries_code_never_data_or_secrets(tmp_path):
     assert len(packa) == 1 and packa[0]["url"] == "https://github.com/o/PackA.git" and len(man["packs"]) == 1 + len(__import__("basetest").base_packs())
 
 
+def test_unit_the_driver_floor_comes_from_the_torch_build_never_the_capture_machine(tmp_path):
+    """Issue #2: a runtime captured on a machine that runs driver 615 must install on a 580 machine, because its cu130 wheels
+    need only 580. Capture runs with the machine's driver faked to 615; the apply side holds the real gate (BASE_FAKE_ROOT off)."""
+    src = tmp_path / "src"; _green_tree(src); (src / "comfy-base" / "state" / "last-run").mkdir(parents=True)
+    (src / "comfy-base" / "state" / "last-run" / "pkg").write_text("green 20261026-000000 1.0.0\n")
+    cap = ('source "%s/base.sh"; eval "$(declare -f base_discover | sed "1s/base_discover/_orig_discover/")"; '
+           'base_discover(){ _orig_discover "$@"; DRIVER=615.10; }; base_runtime_capture "%s"' % (BASE, tmp_path / "cap"))
+    r = subprocess.run(["bash", "-c", cap], capture_output=True, text=True, env=_env(src))
+    assert r.returncode == 0, r.stdout + r.stderr
+    m = json.loads((tmp_path / "cap" / "runtime.json").read_text())
+    assert m["driver_min"] == "580" and m["cuda"] == "13.0"
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    r = _base(["runtime-apply", str(tmp_path / "cap" / "runtime.json")], dst)
+    assert r.returncode == 0, r.stdout + r.stderr
+    gate = ('source "%s/base.sh"; base_env_setup; DRIVER=%s; _base_runtime_init >/dev/null && BASE_FAKE_ROOT= _base_driver_gate >/dev/null' % (BASE, "%s"))
+    env = _env(dst, BASE_RUNTIME=str(dst / "comfy-base" / "state" / "runtime.json"))
+    assert subprocess.run(["bash", "-c", gate % "580.178.04"], capture_output=True, text=True, env=env).returncode == 0
+    assert subprocess.run(["bash", "-c", gate % "575.10"], capture_output=True, text=True, env=env).returncode != 0
+
+
+def test_unit_the_driver_floor_table_and_a_build_with_no_cuda(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("runtime_mod", RT); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    assert mod.driver_floor("13.0") == 580 and mod.driver_floor("13.2") == 580 and mod.driver_floor("12.8") == 525
+    for bad in ("", None, "cpu", "99.0"):
+        with pytest.raises(SystemExit):
+            mod.driver_floor(bad)
+    src = tmp_path / "src"; _green_tree(src)
+    r = subprocess.run(["python3", str(RT), "build", "--root", str(src), "--comfy", str(src / "ComfyUI"), "--out", str(tmp_path / "o"), "--torch-cuda", ""],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "driver floor" in r.stderr
+
+
+def test_unit_every_part_unpacks_alone_and_in_any_order(tmp_path):
+    """3.29.3: independent parts. Each one unpacks into an empty folder by itself (the directories above its files ride in it),
+    and the parts applied at once, largest first, make exactly the tree the parts applied one at a time make."""
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
+    assert len(man["parts"]) > 3
+    for i, p in enumerate(man["parts"]):
+        alone = tmp_path / ("alone%d" % i); alone.mkdir()
+        with subprocess.Popen(["zstd", "-dc", "-q", str(out / p["name"])], stdout=subprocess.PIPE) as z:
+            r = subprocess.run(["tar", "-xf", "-", "-C", str(alone)], stdin=z.stdout, capture_output=True, text=True)
+        assert z.returncode == 0 and r.returncode == 0, r.stderr
+    trees = {}
+    for jobs in (1, 6):
+        dst = tmp_path / ("dst%d" % jobs); dst.mkdir()
+        r = subprocess.run(["python3", str(RT), "apply", str(out / "runtime.json"), str(out / "runtime.json"), "--root", str(dst),
+                            "--work", str(tmp_path / ("w%d" % jobs)), "--jobs", str(jobs)], capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        trees[jobs] = sorted(str(p.relative_to(dst)) + ("->" + os.readlink(p) if p.is_symlink() else "") + ("" if p.is_symlink() or p.is_dir() else ":" + str(p.stat().st_size))
+                             for p in dst.rglob("*"))
+    assert trees[1] == trees[6] and "ComfyUI/main.py:0" in trees[1] and "comfy-base/tools->tools.3.99.1" in trees[1]
+    assert not any("/output" in t or "tokens.env" in t for t in trees[1])
+
+
+class _Server:
+    """A loopback http server for the parts: counts the requests in flight at once, can demand a signature in the query."""
+
+    def __init__(self, directory, need="", delay=0.0):
+        self.live = self.peak = 0
+        self.lock = threading.Lock()
+        outer = self
+
+        class H(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if outer.need and outer.need not in self.path:
+                    self.send_error(403); return
+                with outer.lock:
+                    outer.live += 1; outer.peak = max(outer.peak, outer.live)
+                try:
+                    time.sleep(outer.delay)
+                    super().do_GET()
+                finally:
+                    with outer.lock:
+                        outer.live -= 1
+        self.need, self.delay = need, delay
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(H, directory=str(directory)))
+        self.url = "http://127.0.0.1:%d" % self.srv.server_address[1]
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start(); return self
+
+    def __exit__(self, *a):
+        self.srv.shutdown(); self.srv.server_close(); self.thread.join()
+
+
+def test_unit_apply_fetches_several_parts_at_once_from_a_manifest_url(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
+    dst = tmp_path / "dst"; dst.mkdir()
+    with _Server(out, delay=0.15) as srv:
+        (tmp_path / "m").mkdir(); (tmp_path / "m" / "runtime.json").write_bytes((out / "runtime.json").read_bytes())
+        r = subprocess.run(["python3", str(RT), "apply", str(tmp_path / "m" / "runtime.json"), srv.url + "/runtime.json", "--root", str(dst),
+                            "--work", str(tmp_path / "w"), "--jobs", "4", "--result", str(tmp_path / "res.json")], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert 2 <= srv.peak <= 4, srv.peak                                      # several at once, never more than --jobs
+    assert (dst / "ComfyUI" / "custom_nodes" / "PackA" / "README").exists() and not (tmp_path / "w" / "runtime.000.tar.zst").exists()
+    res = json.loads((tmp_path / "res.json").read_text())
+    assert res["parts"] == len(man["parts"]) and res["bytes"] == sum(p["bytes"] for p in man["parts"]) and res["jobs"] == 4 and res["gbps"] >= 0
+
+
+def test_unit_signed_links_beside_a_local_manifest_are_used_and_never_printed(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
+    held = tmp_path / "held"; held.mkdir(); (held / "runtime.json").write_bytes((out / "runtime.json").read_bytes())      # no parts beside it
+    dst = tmp_path / "dst"; dst.mkdir()
+    with _Server(out, need="sig=s3cret") as srv:
+        links = [{"name": p["name"], "url": "%s/%s?sig=s3cret" % (srv.url, p["name"]), "sha256": p["sha256"], "bytes": p["bytes"]} for p in man["parts"]]
+        mraw = (held / "runtime.json").read_bytes()               # the site's entitlement `runtime` object, as it comes
+        ent = {"id": "rt-1", "manifest": {"url": srv.url + "/runtime.json", "sha256": __import__("hashlib").sha256(mraw).hexdigest(), "bytes": len(mraw)}, "parts": links}
+        (held / "links.json").write_text(json.dumps(ent))
+        r = subprocess.run(["python3", str(RT), "apply", str(held / "runtime.json"), str(held / "runtime.json"), "--parts", str(held / "links.json"),
+                            "--root", str(dst), "--work", str(tmp_path / "w")], capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "s3cret" not in r.stdout + r.stderr
+        ent["manifest"]["sha256"] = "0" * 64                       # links that name another manifest are refused before any fetch
+        (held / "links.json").write_text(json.dumps(ent))
+        other = subprocess.run(["python3", str(RT), "apply", str(held / "runtime.json"), str(held / "runtime.json"), "--parts", str(held / "links.json"),
+                                "--root", str(tmp_path / "dx"), "--work", str(tmp_path / "wx")], capture_output=True, text=True)
+        assert other.returncode != 0 and "not the one the link list names" in other.stderr and not (tmp_path / "dx").exists()
+        (held / "links.json").write_text(json.dumps(links))        # and a bare list of parts is accepted too
+        links[1]["url"] = "%s/%s?sig=wrong" % (srv.url, man["parts"][1]["name"])              # a link the server refuses
+        (held / "links.json").write_text(json.dumps(links))
+        dst2 = tmp_path / "dst2"; dst2.mkdir()
+        bad = subprocess.run(["python3", str(RT), "apply", str(held / "runtime.json"), str(held / "runtime.json"), "--parts", str(held / "links.json"),
+                              "--root", str(dst2), "--work", str(tmp_path / "w2")], capture_output=True, text=True)
+    assert bad.returncode == 1 and man["parts"][1]["name"] in bad.stderr and "wrong" not in bad.stdout + bad.stderr
+    links[0]["bytes"] += 1; (held / "links.json").write_text(json.dumps(links))
+    odd = subprocess.run(["python3", str(RT), "sources", str(held / "runtime.json"), str(held / "runtime.json"), "--parts", str(held / "links.json")], capture_output=True, text=True)
+    assert odd.returncode != 0 and "manifest says" in odd.stderr
+
+
+def test_unit_a_runtime_of_the_old_format_is_refused_by_name(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out)
+    m = json.loads((out / "runtime.json").read_text()); m["format"] = 1; (out / "runtime.json").write_text(json.dumps(m))
+    r = subprocess.run(["python3", str(RT), "apply", str(out / "runtime.json"), str(out / "runtime.json"), "--root", str(tmp_path / "d"), "--work", str(tmp_path / "w")],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "capture it again" in r.stderr
+
+
+def test_unit_runtime_apply_records_a_runtime_row_in_the_timing_ledger(tmp_path):
+    src, out, dst = _applied(tmp_path)
+    logs = dst / "comfy-base" / "state" / "logs"
+    timings = "".join(f.read_text() for f in logs.glob("runtime-apply_*.timings.tsv"))
+    timeline = "".join(f.read_text() for f in logs.glob("runtime-apply_*.timeline.tsv"))
+    assert "RUNTIME fetch and unpack" in timings and "GB/s" in timings and "parts" in timings
+    row = [ln for ln in timeline.splitlines() if "RUNTIME fetch and unpack" in ln]
+    assert len(row) == 1 and row[0].split("\t")[0].isdigit()
+    res = json.loads((dst / "comfy-base" / "state" / "runtime-apply.json").read_text())
+    assert res["bytes"] > 0 and res["raw"] > 0 and res["parts"] > 1 and "gbps" in res
+
+
+def test_unit_runtime_apply_takes_jobs_and_a_manifest_url(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=40000)
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    with _Server(out, delay=0.1) as srv:
+        r = _base(["runtime-apply", srv.url + "/runtime.json", "--jobs", "3"], dst)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert 2 <= srv.peak <= 3 and (dst / "comfy-base" / "state" / "runtime.stamp").exists()
+    assert _base(["runtime-apply", "x.json", "--jobs", "0"], dst).returncode == 2
+
+
 def test_unit_verify_parts_names_the_first_part_that_differs(tmp_path):
-    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
     ok = subprocess.run(["python3", str(RT), "verify-parts", str(out / "runtime.json"), str(out)], capture_output=True, text=True)
     assert ok.returncode == 0, ok.stderr
     p = out / man["parts"][1]["name"]; b = bytearray(p.read_bytes()); b[0] ^= 1; p.write_bytes(bytes(b))
@@ -142,7 +314,7 @@ def _base(cmd, root, **extra):
 
 
 def _applied(tmp_path):
-    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=700)
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=40000)
     dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
     r = _base(["runtime-apply", str(out / "runtime.json")], dst)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -159,13 +331,13 @@ def test_unit_runtime_apply_unpacks_stamps_and_is_idempotent(tmp_path):
     assert again.returncode == 0 and "already applied" in again.stdout
 
 
-def test_unit_a_corrupt_part_stops_before_anything_is_unpacked(tmp_path):
-    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
+def test_unit_a_corrupt_part_fails_the_apply_by_name_and_stamps_nothing(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
     p = out / man["parts"][0]["name"]; b = bytearray(p.read_bytes()); b[-1] ^= 1; p.write_bytes(bytes(b))
     dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
     r = _base(["runtime-apply", str(out / "runtime.json")], dst)
-    assert r.returncode != 0 and "do not match" in r.stdout + r.stderr
-    assert not (dst / "ComfyUI").exists() and not (dst / "comfy-base" / "state" / "runtime.stamp").exists()
+    assert r.returncode != 0 and man["parts"][0]["name"] in r.stdout + r.stderr and "sha256" in r.stdout + r.stderr
+    assert not (dst / "comfy-base" / "state" / "runtime.stamp").exists()           # parts unpack as they land: the stamp is what a run trusts
 
 
 def test_unit_runtime_apply_refuses_a_shared_store(tmp_path):
@@ -228,6 +400,9 @@ def test_unit_the_stub_installs_from_the_runtime_with_no_git_pip_or_uv_fetch(tmp
         else:
             assert tool == "uv" and rest.strip() == "--version", ln
     assert "runtime mode" in r.stdout and "runtime " in r.stdout
+    assert (dst / "ComfyUI" / "models" / "vae" / "Example" / "Real" / "stub_vae.safetensors").exists()      # 3.30.1: fetched by the early pass
+    tl = "".join(f.read_text() for f in (dst / "comfy-base" / "state" / "logs").glob("stub_*.timeline.tsv"))
+    assert "MODELS (in the background" in tl and "RUNTIME (in the background" not in tl      # the runtime was applied before this run: no wait
 
 
 def test_unit_run_order_keeps_the_3_0_steps_for_every_plain_run():
@@ -238,3 +413,339 @@ def test_unit_run_order_keeps_the_3_0_steps_for_every_plain_run():
     for a, b in (("_base_system_join", "base_venv_snapshot"), ("base_venv_snapshot", "if ! base_venv"), ("if ! base_venv", "base_packs pip"), ("base_packs pip", "base_mcp"), ("base_mcp", "base_venv_latest")):
         assert plain.index(a) < plain.index(b)
     assert "else base_system || src=$?; fi" in run and "else base_update_comfyui || true; fi" in run
+
+
+# ---------------------------------------------------------------- 3.30.1: the models start while the runtime is still unpacking
+
+def _need_stub():
+    stub = BASE / "_build" / "stub"
+    if not stub.exists():
+        pytest.skip("_build/stub is repo tooling")
+    return stub
+
+
+def _install_beside_an_apply(dst, tmp_path, extra=None):
+    from basetest import run_script
+    stub = _need_stub()
+    shutil.copytree(stub, dst / "pkg")
+    (dst / "somewhere").mkdir(exist_ok=True); (dst / "somewhere" / "stub_local.safetensors").write_bytes(b"mine")
+    env = {"BASE_RUNTIME": str(dst / "comfy-base" / "state" / "runtime.json"), "BASE_NO_SUITE": "1"}
+    env.update(extra or {})
+    return run_script(dst / "pkg" / "stub-script.sh", fake_root=dst, env=env)
+
+
+def _spans(dst):
+    rows = {}
+    for f in (dst / "comfy-base" / "state" / "logs").glob("stub_*.timeline.tsv"):
+        for ln in f.read_text().splitlines():
+            if ln and not ln.startswith("#"):
+                t0, t1, secs, what = ln.split("\t", 3)
+                rows[what] = (int(t0), int(t1))
+    return rows
+
+
+def test_unit_the_models_start_before_the_unpack_ends_and_only_the_tree_waits(tmp_path):
+    _need_stub()                                                  # before the apply is started: a skip must leave nothing running
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=80000)
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    lock = dst / "comfy-base" / "state" / "runtime.applying"
+    with _Server(out, delay=1.5) as srv:
+        with subprocess.Popen(["bash", str(BASE / "base.sh"), "runtime-apply", srv.url + "/runtime.json", "--jobs", "1"], env=_env(dst),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as ap:      # the with waits for it and closes its pipe
+            try:
+                for _ in range(200):
+                    if lock.exists():
+                        break
+                    time.sleep(0.05)
+                assert lock.exists()
+                r = _install_beside_an_apply(dst, tmp_path)
+                apply_out = ap.communicate(timeout=120)[0]
+            except BaseException:
+                ap.kill()                                         # a failed assertion must not leave the apply running to be finalized later
+                raise
+    assert ap.returncode == 0, apply_out
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1500:]
+    assert "still unpacking" in r.stdout and "the runtime is unpacked" in r.stdout
+    assert not lock.exists() and (dst / "comfy-base" / "state" / "runtime.stamp").exists()
+    spans = _spans(dst)
+    models = spans["MODELS (in the background, beside the venv build)"]
+    unpack = next(v for k, v in spans.items() if k.startswith("RUNTIME (in the background"))
+    waited = spans["RUNTIME · waiting for the unpack"]
+    assert models[0] < unpack[1]                                  # the downloads began before the unpack ended
+    assert waited[1] >= unpack[1] - 1 and waited[0] < unpack[1]   # and the tree is what waited for it
+    assert "COMFYUI · the proven runtime" in spans and spans["COMFYUI · the proven runtime"][0] >= waited[1]
+    assert (dst / "ComfyUI" / "models" / "vae" / "Example" / "Real" / "stub_vae.safetensors").exists()
+    assert (dst / "ComfyUI" / "custom_nodes" / "PackA" / "README").exists()
+
+
+def test_unit_an_apply_that_ends_without_a_stamp_fails_the_install_by_name(tmp_path):
+    _need_stub()
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out)
+    dst = tmp_path / "dst"; st = dst / "comfy-base" / "state"; st.mkdir(parents=True)
+    shutil.copy(out / "runtime.json", st / "runtime.json")
+    sha = __import__("hashlib").sha256((st / "runtime.json").read_bytes()).hexdigest()
+    pid = subprocess.run(["sh", "-c", "sleep 4 </dev/null >/dev/null 2>&1 & echo $!"], capture_output=True, text=True).stdout.strip()   # reaped by init
+    (st / "runtime.applying").write_text("%s %s\n" % (pid, sha))
+    r = _install_beside_an_apply(dst, tmp_path)
+    assert r.returncode != 0 and "ended without finishing" in r.stdout + r.stderr
+    assert not (st / "runtime.stamp").exists()
+
+
+def test_unit_a_lock_whose_process_is_gone_is_no_lock_and_a_library_waits_for_the_tree(tmp_path):
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    (dst / "comfy-base" / "state" / "runtime.applying").write_text("999999 abc\n")
+    snippet = 'source "%s/base.sh"; base_env_setup; _base_runtime_applying abc && echo LOCKED || echo FREE; ' % BASE
+    r = subprocess.run(["bash", "-c", snippet + '_base_runtime_early_ok && echo EARLY || echo LATE'], capture_output=True, text=True, env=_env(dst))
+    assert r.stdout.split() == ["FREE", "EARLY"], r.stdout + r.stderr
+    (tmp_path / "lib").mkdir()                                  # base_env_setup ignores a BASE_LIBRARY that is not a directory
+    r = subprocess.run(["bash", "-c", snippet + '_base_runtime_early_ok && echo EARLY || echo LATE'], capture_output=True, text=True, env=_env(dst, BASE_LIBRARY=str(tmp_path / "lib")))
+    assert r.stdout.split() == ["FREE", "LATE"], r.stdout + r.stderr
+
+
+# ---------------------------------------------------------------- 3.30.2: RunPod's stock image in runtime mode: apt, zstd, the tree
+
+def _fake_apt(tmp_path, installed):
+    """A stand-in apt-get and dpkg-query on PATH: dpkg-query answers from a file, apt-get logs and appends what it installs."""
+    d = tmp_path / "fakeapt"; d.mkdir(); log = tmp_path / "apt.log"; inst = tmp_path / "installed.txt"
+    inst.write_text("".join(x + "\n" for x in installed))
+    (d / "dpkg-query").write_text('#!/bin/bash\nfor last; do :; done\ngrep -qx "$last" "%s" && printf "ii " || printf "un "\nexit 0\n' % inst)
+    (d / "apt-get").write_text(
+        '#!/bin/bash\necho "apt-get $*" >> "%s"\ninst=0; skip=0\nfor a in "$@"; do\n  if [ $skip = 1 ]; then skip=0; continue; fi\n'
+        '  case "$a" in -o) skip=1;; -*) ;; install) inst=1;; update) ;; *) [ $inst = 1 ] && echo "$a" >> "%s";; esac\ndone\nexit 0\n' % (log, inst))
+    for f in d.iterdir():
+        f.chmod(0o755)
+    return d, log, inst
+
+
+def test_unit_capture_writes_the_apt_packages_its_machine_has(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); (src / "comfy-base" / "state" / "last-run").mkdir(parents=True)
+    (src / "comfy-base" / "state" / "last-run" / "pkg").write_text("green 20261026-000000 1.0.0\n")
+    d, log, inst = _fake_apt(tmp_path, ["zstd", "python3-venv", "ffmpeg", "libegl1", "libgles2", "openssh-server"])
+    r = _base(["runtime-capture", str(tmp_path / "cap")], src, PATH="%s:%s" % (d, os.environ["PATH"]))
+    assert r.returncode == 0, r.stdout + r.stderr
+    m = json.loads((tmp_path / "cap" / "runtime.json").read_text())
+    assert m["apt"] == ["zstd", "python3-venv", "ffmpeg", "libegl1", "libgles2", "openssh-server"]       # zstd first; nfs-common is not installed there
+    out = subprocess.run(["python3", str(RT), "apt", str(tmp_path / "cap" / "runtime.json")], capture_output=True, text=True).stdout.split()
+    assert out == m["apt"]
+
+
+def test_unit_apply_installs_only_the_missing_apt_packages_zstd_first_and_records_the_seconds(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"
+    _build(src, out, part_bytes=40000, apt="zstd,python3-venv,ffmpeg,libegl1,libgles2")
+    d, log, inst = _fake_apt(tmp_path, ["ffmpeg"])                                  # the image has ffmpeg, nothing else
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    r = _base(["runtime-apply", str(out / "runtime.json")], dst, PATH="%s:%s" % (d, os.environ["PATH"]), BASE_FAKE_APT=str(d))
+    assert r.returncode == 0, r.stdout + r.stderr
+    installs = [ln for ln in log.read_text().splitlines() if " install " in ln]
+    assert len(installs) == 2 and installs[0].endswith("install zstd python3-venv") and installs[1].endswith("install libegl1 libgles2"), installs
+    assert "ffmpeg" not in " ".join(installs)                                         # present: never reinstalled
+    assert (dst / "comfy-base" / "state" / "runtime.stamp").exists()
+    res = json.loads((dst / "comfy-base" / "state" / "runtime-apply.json").read_text())
+    assert res["apt_installed"] == ["zstd", "python3-venv", "libegl1", "libgles2"] and res["apt_failed"] == [] and res["apt_seconds"] >= 0
+    timings = "".join(f.read_text() for f in (dst / "comfy-base" / "state" / "logs").glob("runtime-apply_*.timings.tsv"))
+    assert "RUNTIME fetch and unpack" in timings and "apt " in timings and "libegl1" in timings
+    again = _base(["runtime-apply", str(out / "runtime.json")], dst, PATH="%s:%s" % (d, os.environ["PATH"]), BASE_FAKE_APT=str(d))
+    assert again.returncode == 0 and "already applied" in again.stdout
+    assert len([ln for ln in log.read_text().splitlines() if " install " in ln]) == 2        # nothing missing, nothing run
+
+
+def test_unit_a_machine_that_cannot_install_says_which_packages_and_still_unpacks(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"
+    _build(src, out, part_bytes=40000, apt="zstd,ffmpeg,libegl1")
+    d, log, inst = _fake_apt(tmp_path, [])
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    r = _base(["runtime-apply", str(out / "runtime.json")], dst, PATH="%s:%s" % (d, os.environ["PATH"]), BASE_FAKE_APT=str(d), BASE_FAKE_APT_NOROOT="1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "could not install" in r.stdout and "ffmpeg" in r.stdout and not log.exists()
+    res = json.loads((dst / "comfy-base" / "state" / "runtime-apply.json").read_text())
+    assert set(res["apt_failed"]) == {"zstd", "ffmpeg", "libegl1"}
+    # the install carries it into its own summary
+    r2 = subprocess.run(["bash", "-c", 'source "%s/base.sh"; base_env_setup; _base_runtime_apt_warn; printf "W %%s\\n" "${BASE_WARN[@]}"' % BASE],
+                        capture_output=True, text=True, env=_env(dst))
+    assert "could not install: zstd ffmpeg libegl1" in r2.stdout + r2.stderr
+
+
+def test_unit_the_unpack_waits_for_zstd_only_while_its_install_runs(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=40000)
+    bare = tmp_path / "bare"; bare.mkdir()                                               # a PATH with no zstd, no tar
+    gate = tmp_path / "zstd.failed"; gate.write_text("")                                 # the install of it has failed
+    t0 = time.time()
+    r = subprocess.run([__import__("sys").executable, str(RT), "apply", str(out / "runtime.json"), str(out / "runtime.json"), "--root", str(tmp_path / "d"),
+                        "--work", str(tmp_path / "w"), "--zstd-wait", "60", "--zstd-gate", str(gate)], capture_output=True, text=True, env={"PATH": str(bare)})
+    assert r.returncode == 1 and "zstd is not installed" in r.stderr and time.time() - t0 < 30      # the gate ends the wait at once
+
+
+def test_unit_runtime_mode_reads_the_runtimes_tree_not_another_one_on_the_volume(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=40000)
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    assert _base(["runtime-apply", str(out / "runtime.json")], dst).returncode == 0
+    other = dst / "runpod-slim" / "ComfyUI"; other.mkdir(parents=True); (other / "main.py").write_text("")       # RunPod's own tree, recorded by an earlier install
+    (dst / "comfy-base" / "state" / "boot.env").write_text("COMFY=%s\n" % other)
+    snippet = 'source "%s/base.sh"; base_env_setup; _base_runtime_pin_tree; base_discover quiet; echo "COMFY=$COMFY"' % BASE
+    r = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True, env=_env(dst, BASE_RUNTIME=str(dst / "comfy-base" / "state" / "runtime.json")))
+    assert "COMFY=%s" % (dst / "ComfyUI").resolve() in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_runtime_mode_never_reaches_the_cublas_probe_uv_or_a_local_run_copy():
+    """3.30.2, RunPod's runpod/comfyui:1.4.7-cuda13.0 (nvcc and cudart only, no cuBLAS): cuBLAS is for source builds, which runtime mode
+    never starts; no uv step runs; the image's own ComfyUI is never a candidate; the local-run copy decides by the filesystem."""
+    summary = (BASE / "lib" / "95-summary.sh").read_text()
+    branch = summary[summary.index("  if _base_runtime_on; then\n    _base_hook pkg_pre_venv"):summary.index("  else\n  if [ \"$sysbg\" = 1 ]")]
+    for never in ("cuda_toolchain", "_base_ensure_uv", "base_venv", "base_packs pip", "base_mcp"):
+        assert never not in branch.replace("_base_runtime_venv", ""), never
+    packs = (BASE / "lib" / "40-packs.sh").read_text()
+    assert "_base_runtime_on || [ \"${BASE_CUDA_FOREGROUND:-0}\" = \"1\" ]" in packs                 # the background probe is off in runtime mode
+    assert "/opt/comfyui-baked" not in "".join((BASE / "lib" / f).read_text() for f in os.listdir(BASE / "lib") if f.endswith(".sh"))
+    run_local = (BASE / "py" / "run_local.py").read_text()
+    assert "not a network filesystem: it runs in place" in run_local                       # BASE_LOCAL_RUN=auto leaves a local /workspace alone
+
+
+def test_unit_the_default_part_is_256_mib_and_no_part_may_pass_the_upload_cap(tmp_path):
+    spec = importlib.util.spec_from_file_location("runtime_mod2", RT); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    assert mod.PART_BYTES == 268435456 and mod.OBJECT_CAP == 315_000_000
+    assert mod.PART_BYTES + 512 * 1024 < mod.OBJECT_CAP                                  # even a part that does not compress stays under the cap
+    assert mod.oversize([{"name": "a", "bytes": 314_999_999}, {"name": "b", "bytes": 315_000_001}]) == ["b"]
+    assert mod.oversize([{"name": "b", "bytes": 10 ** 12}], cap=0) == []
+    src = tmp_path / "src"; _green_tree(src)
+    r = subprocess.run(["python3", str(RT), "build", "--root", str(src), "--comfy", str(src / "ComfyUI"), "--out", str(tmp_path / "o"), "--torch-cuda", "13.0"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert len(json.loads((tmp_path / "o" / "runtime.json").read_text())["parts"]) == 1                 # the fake tree is far below one part
+    tight = subprocess.run(["python3", str(RT), "build", "--root", str(src), "--comfy", str(src / "ComfyUI"), "--out", str(tmp_path / "o2"), "--torch-cuda", "13.0",
+                            "--max-packed", "1000"], capture_output=True, text=True)
+    assert tight.returncode != 0 and "--max-packed" in tight.stderr                                      # a part over the cap is an error, not a note
+
+
+# ---------------------------------------------------------------- 3.30.3: a file larger than a part is split across parts
+
+LIMIT = 100_000
+
+
+def _rt():
+    spec = importlib.util.spec_from_file_location("runtime_split", RT); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod
+
+
+def _with_a_big_file(tmp_path, size=250_000):
+    """A green tree plus one 'library' of random bytes (no compression) that is 2.5 parts long, and a build of it."""
+    src = tmp_path / "src"; _green_tree(src)
+    big = src / "ComfyUI" / ".venv-cu130" / "lib" / "libbig.so"; big.parent.mkdir(parents=True, exist_ok=True)
+    big.write_bytes(random.Random(7).randbytes(size)); big.chmod(0o755); os.utime(big, (1_700_000_000, 1_700_000_000))
+    out = tmp_path / "out"
+    r = subprocess.run(["python3", str(RT), "build", "--root", str(src), "--comfy", str(src / "ComfyUI"), "--out", str(out), "--torch-cuda", "13.0",
+                        "--part-bytes", str(LIMIT)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return src, out, big, json.loads((out / "runtime.json").read_text())
+
+
+def _apply(manifest, out, dst, work, jobs=4):
+    return subprocess.run(["python3", str(RT), "apply", str(manifest), str(out / "runtime.json"), "--root", str(dst), "--work", str(work), "--jobs", str(jobs)],
+                          capture_output=True, text=True)
+
+
+def test_unit_a_file_larger_than_a_part_is_cut_into_chunks_in_parts_of_their_own(tmp_path):
+    src, out, big, m = _with_a_big_file(tmp_path)
+    assert m["format"] == 3 and len(m["files"]) == 1
+    f = m["files"][0]
+    assert f["path"] == "ComfyUI/.venv-cu130/lib/libbig.so" and f["bytes"] == 250_000 and f["mode"] == 0o755 and f["mtime"] == 1_700_000_000
+    assert f["sha256"] == __import__("hashlib").sha256(big.read_bytes()).hexdigest()
+    assert [c["offset"] for c in f["chunks"]] == [0, 100_000, 200_000] and [c["bytes"] for c in f["chunks"]] == [100_000, 100_000, 50_000]
+    assert len({c["part"] for c in f["chunks"]}) == 3                                    # one file's chunks are in different parts: they fetch at once
+    kinds = {p["name"]: p.get("kind") for p in m["parts"]}
+    assert {c["part"] for c in f["chunks"]} == {n for n, k in kinds.items() if k == "chunks"}
+    for p in m["parts"]:                                                                # no part is larger than a part plus headers
+        assert p["bytes"] <= LIMIT + 4096 and p["raw"] <= LIMIT, (p["name"], p["bytes"], p["raw"])
+    names = _names(out, {"parts": [p for p in m["parts"] if p.get("kind") != "chunks"]})
+    assert not any(n.endswith("libbig.so") for n in names)                              # the file itself is in no ordinary part
+    assert "ComfyUI/.venv-cu130/lib" in names                                           # the directory above it still arrives, with the first part
+
+
+def test_unit_the_chunks_join_into_the_file_whatever_order_the_parts_land_in(tmp_path):
+    src, out, big, m = _with_a_big_file(tmp_path)
+    for jobs in (1, 4):
+        dst = tmp_path / ("dst%d" % jobs); dst.mkdir()
+        r = _apply(out / "runtime.json", out, dst, tmp_path / ("w%d" % jobs), jobs=jobs)
+        assert r.returncode == 0, r.stdout + r.stderr
+        t = dst / "ComfyUI" / ".venv-cu130" / "lib" / "libbig.so"
+        assert t.read_bytes() == big.read_bytes() and (t.stat().st_mode & 0o7777) == 0o755 and int(t.stat().st_mtime) == 1_700_000_000
+        assert "1 split file(s)" in r.stdout
+    mod = _rt()
+    chunk_parts = [p for p in m["parts"] if p.get("kind") == "chunks"]
+    for order in ([2, 1, 0], [1, 2, 0], [2, 0, 1]):                                     # parts landing out of order, each writing at its own offset
+        dst = tmp_path / ("ooo%d%d%d" % tuple(order)); dst.mkdir()
+        files, cmap, count = mod._plan(m, {p["name"] for p in m["parts"]})
+        mod._prepare_files(files, dst)
+        assert (dst / files[0]["path"]).stat().st_size == 250_000                        # created at its full size first
+        for i in order:
+            mod._unpack_chunks(out / chunk_parts[i]["name"], chunk_parts[i]["name"], cmap, files, dst)
+        mod._finish_file(files[0], dst)
+        assert (dst / files[0]["path"]).read_bytes() == big.read_bytes()
+
+
+def test_unit_a_missing_a_wrong_or_a_corrupt_chunk_fails_by_the_files_or_the_parts_name(tmp_path):
+    src, out, big, m = _with_a_big_file(tmp_path)
+    path = m["files"][0]["path"]
+    # 1. a chunk the manifest lists is not in its part
+    lost = json.loads(json.dumps(m)); lost["files"][0]["chunks"][1]["member"] = "f0000.c999"
+    (tmp_path / "lost.json").write_text(json.dumps(lost))
+    r = _apply(tmp_path / "lost.json", out, tmp_path / "d1", tmp_path / "w1")
+    assert r.returncode == 1 and path in r.stderr and "f0000.c999" in r.stderr and "not in this part" in r.stderr
+    # 2. every part is the one the manifest names, but the file does not add up to its sha256
+    wrong = json.loads(json.dumps(m)); wrong["files"][0]["sha256"] = "0" * 64
+    (tmp_path / "wrong.json").write_text(json.dumps(wrong))
+    r = _apply(tmp_path / "wrong.json", out, tmp_path / "d2", tmp_path / "w2")
+    assert r.returncode == 1 and path in r.stderr and "sha256" in r.stderr
+    # 3. a corrupt chunk part: its own sha256 stops it, by part name, before a byte is written
+    bad = tmp_path / "bad"; shutil.copytree(out, bad)
+    part = next(p for p in m["parts"] if p.get("kind") == "chunks")["name"]
+    b = bytearray((bad / part).read_bytes()); b[200] ^= 1; (bad / part).write_bytes(bytes(b))
+    r = _apply(bad / "runtime.json", bad, tmp_path / "d3", tmp_path / "w3")
+    assert r.returncode == 1 and part in r.stderr and "sha256" in r.stderr
+    # 4. a chunk part rebuilt with different bytes under a correct part sha256: the whole file is the judge
+    rebuilt = tmp_path / "rebuilt"; shutil.copytree(out, rebuilt)
+    c = m["files"][0]["chunks"][0]
+    mod = _rt()
+    payload = tmp_path / "payload"; payload.write_bytes(b"\x01" * c["bytes"])
+    mod_items = [("chunk", payload, c["member"], 0, c["bytes"], 0)]
+    made = mod._write_part(rebuilt, c["part"], mod_items, 3)
+    forged = json.loads(json.dumps(m))
+    for p in forged["parts"]:
+        if p["name"] == c["part"]:
+            p.update(bytes=made["bytes"], sha256=made["sha256"], raw=made["raw"])
+    (rebuilt / "runtime.json").write_text(json.dumps(forged))
+    r = _apply(rebuilt / "runtime.json", rebuilt, tmp_path / "d4", tmp_path / "w4")
+    assert r.returncode == 1 and path in r.stderr and "does not match its sha256" in r.stderr
+
+
+def test_unit_a_manifest_whose_chunks_do_not_add_up_is_refused_before_anything_is_written(tmp_path):
+    src, out, big, m = _with_a_big_file(tmp_path)
+    mod = _rt()
+    names = {p["name"] for p in m["parts"]}
+    gap = json.loads(json.dumps(m)); gap["files"][0]["chunks"][1]["offset"] += 1
+    short = json.loads(json.dumps(m)); short["files"][0]["bytes"] += 5
+    ghost = json.loads(json.dumps(m)); ghost["files"][0]["chunks"][0]["part"] = "runtime.999.tar.zst"
+    outside = json.loads(json.dumps(m)); outside["files"][0]["path"] = "../escape"
+    for bad, word in ((gap, "gap or overlap"), (short, "add up"), (ghost, "does not list"), (outside, "not inside")):
+        with pytest.raises(SystemExit) as e:
+            mod._plan(bad, names)
+        assert word in str(e.value), (word, str(e.value))
+    (tmp_path / "gap.json").write_text(json.dumps(gap))
+    r = _apply(tmp_path / "gap.json", out, tmp_path / "dx", tmp_path / "wx")
+    assert r.returncode != 0 and not (tmp_path / "dx" / "ComfyUI").exists()
+
+
+def test_unit_apply_still_reads_a_format_2_runtime_and_the_ledger_counts_split_files(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=40000)
+    m = json.loads((out / "runtime.json").read_text()); m["format"] = 2; m.pop("files")
+    (out / "runtime.json").write_text(json.dumps(m))
+    r = _apply(out / "runtime.json", out, tmp_path / "dst", tmp_path / "w")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / "dst" / "ComfyUI" / "main.py").exists()
+    assert "split file" not in r.stdout
+    src2, out2, big, m2 = _with_a_big_file(tmp_path / "two")
+    res = tmp_path / "res.json"
+    r = subprocess.run(["python3", str(RT), "apply", str(out2 / "runtime.json"), str(out2 / "runtime.json"), "--root", str(tmp_path / "dst2"), "--work", str(tmp_path / "w2"),
+                        "--result", str(res)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    line = subprocess.run(["python3", str(RT), "ledger-line", str(res)], capture_output=True, text=True).stdout
+    assert "1 split file(s) verified" in line

@@ -133,12 +133,16 @@ _base_local_dirs(){ # 2.5.6: every directory the launch line names on the MACHIN
 # A value is one word of [A-Za-z0-9_.,:+-]: a number, a flag, an allocator string, never a path or a shell expansion.
 # Precedence: a value the machine's own environment already has (the pod's env, the unit's) > the packages' files, in
 # name order, the first one naming a key winning (a different value later is named on stderr) > the base's default.
-# The base's one default is OMP_NUM_THREADS from the container's CPU QUOTA (_base_cpu_quota), never the host's count.
+# The base's defaults: OMP_NUM_THREADS from the container's CPU QUOTA (_base_cpu_quota), never the host's count; and 3.28.0,
+# CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0 while the venv's cuDNN is 9.22.0 up to 9.25.1 (_base_cudnn_cache_bug). A package cannot set it.
 BASE_LAUNCH_ENV_KEYS="OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS"
 BASE_LAUNCH_ENV_KEYS="$BASE_LAUNCH_ENV_KEYS TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING"
 # 3.18.0: and the attention order a node pack reads when it loads (Generate-AI's Render Speed: off, cudnn or fa4), a
 # one-word flag like the rest: which exact attention kernel runs first, never a path or a library to load
 BASE_LAUNCH_ENV_KEYS="$BASE_LAUNCH_ENV_KEYS RENDER_SPEED_ATTENTION"
+# 3.28.0: and the same pack's thread count for every lanczos resize in the process (RENDER_SPEED_LANCZOS_THREADS=N, off when
+# unset): several frames resized at once, the same bytes, a number like the thread counts above
+BASE_LAUNCH_ENV_KEYS="$BASE_LAUNCH_ENV_KEYS RENDER_SPEED_LANCZOS_THREADS"
 _base_launch_env_ok(){ # KEY=value → 0 when it is an entry the contract above allows
   local k v
   case "$1" in *=*) ;; *) return 1 ;; esac
@@ -183,6 +187,32 @@ _base_cpu_quota(){ # → the whole CPUs this container's cgroup quota allows (ro
   echo "$n"
 }
 _base_launch_env_dir(){ local s="${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}"; [ -n "$s" ] && echo "$s/launch.d"; }
+_base_cudnn_version(){ # 3.28.0: → the cuDNN the venv's torch loads, from its nvidia-cudnn-cu* wheel's name (9.24.0.37); the newest when
+  # there are two; empty when the venv has none (a torch built against a system cuDNN). A directory name: no Python, no torch import.
+  local venv="${VENV:-}" d v all=""
+  if [ -z "$venv" ] && [ -n "${PY:-}" ]; then case "$PY" in */bin/*) venv="${PY%/bin/*}" ;; esac; fi
+  [ -n "$venv" ] || return 0
+  for d in "$venv"/lib/python*/site-packages/nvidia_cudnn_cu*-*.dist-info; do
+    [ -d "$d" ] || continue
+    v="${d##*/}"; v="${v%.dist-info}"; v="${v#*-}"
+    case "$v" in [0-9]*) all="$all$v"$'\n' ;; esac
+  done
+  if [ -n "$all" ]; then printf '%s' "$all" | sort -V | tail -1; fi
+  return 0
+}
+_base_cudnn_cache_bug(){ # 3.28.0: <version> → 0 for cuDNN 9.22.0 up to 9.25.1. NVIDIA, cuDNN 9.25.1 release notes (Fixed Issues): "A
+  # data corruption issue in this cache that could cause a segmentation fault has been fixed. For cuDNN 9.22-9.24, a
+  # workaround was to set the environment variable CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0 to disable the cache." (the default
+  # per-process cache of runtime-compiled kernels, added in 9.22.0). 9.25.0's notes are silent, so nothing fixed it there:
+  # it is covered too. torch 2.14.1 pins 9.24.0. Turning the cache off changes no result.
+  local maj min pat rest
+  IFS=. read -r maj min pat rest <<< "${1:-}"
+  case "$maj" in ''|*[!0-9]*) return 1 ;; esac
+  case "$min" in ''|*[!0-9]*) return 1 ;; esac
+  case "$pat" in '') pat=0 ;; *[!0-9]*) return 1 ;; esac
+  [ "$maj" -eq 9 ] && [ "$min" -ge 22 ] || return 1
+  [ "$min" -le 24 ] || { [ "$min" -eq 25 ] && [ "$pat" -lt 1 ]; }
+}
 _base_launch_env(){ # → the KEY=value lines ComfyUI is started with (precedence above); what was dropped, and why, on stderr
   local dir f kv k v seen="" n s first
   dir="$(_base_launch_env_dir)"
@@ -213,6 +243,8 @@ _base_launch_env(){ # → the KEY=value lines ComfyUI is started with (precedenc
          else seen="$seen|OMP_NUM_THREADS=$n@the CPU quota"; fi
        fi ;;
   esac
+  v="$(_base_cudnn_version)"                                        # 3.28.0: no package may set it, so only the machine's env wins
+  if _base_cudnn_cache_bug "$v"; then seen="$seen|CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0@cuDNN $v (its default kernel cache; fixed in 9.25.1)"; fi
   printf '%s\n' "$seen" | tr '|' '\n' | while IFS= read -r kv; do         # KEY=value@source, one per line (the last one too)
     [ -n "$kv" ] || continue
     k="${kv%%=*}"; v="${kv#*=}"; v="${v%%@*}"
@@ -298,7 +330,12 @@ _base_start_cmd(){ # the exact launch line, in one place, so the hand-off prints
   printf '%s%s%s%s main.py --listen %s --port %s --enable-cors-header%s%s' "${hf:+env HF_HOME=$hf }" "${ff:+env VHS_FORCE_FFMPEG_PATH=$ff }" "${le:+env $le }" "$PY" "$(_base_comfy_listen)" "$PORT" "${pv:+ $pv}" "${extra:+ $extra}"
 }
 _base_start_comfy(){ # every server this machine runs (3.20.0: one per GPU), started together; 0 when server 0 answers
-  local extra=() w pv=() i rc
+  _base_spawn_comfy || return 1
+  _base_wait_spawned
+}
+_base_spawn_comfy(){ # 3.27.0: the start without the wait, so an install can start ComfyUI beside its model downloads and wait
+  # after them (lib/80-server.sh _base_launch_early). What the wait needs is left in BASE_SPAWN_N and BASE_SPAWN_PID.
+  local extra=() w pv=() i
   _base_local_dirs
   local _BASE_SERVER_N="" _BASE_WAIT_PID=""                         # read by the calls below (bash's dynamic scope)
   _BASE_SERVER_N="$(_base_server_count)"                            # counted once: every call below reads it
@@ -323,6 +360,13 @@ _base_start_comfy(){ # every server this machine runs (3.20.0: one per GPU), sta
     _base_spawn_server "$i"
     i=$((i + 1))
   done
+  BASE_SPAWN_N="$_BASE_SERVER_N"; BASE_SPAWN_PID=""
+  if [ "$_BASE_SERVER_N" -gt 1 ]; then BASE_SPAWN_PID="$(cat "$st/comfyui.pid" 2>/dev/null || true)"; fi
+  return 0
+}
+_base_wait_spawned(){ # 3.27.0: wait for what _base_spawn_comfy started; 0 when server 0 answers
+  local rc i
+  local _BASE_SERVER_N="${BASE_SPAWN_N:-1}" _BASE_WAIT_PID="${BASE_SPAWN_PID:-}"   # the spawn's view, for the calls below
   # MEASURED on a live pod: the custom nodes alone import for over three minutes
   # (ComfyUI-SeedVR2_VideoUpscaler 67 s, and thirty more packs behind it), so a flat 180 s window
   # declared `restart FAILED`, skipped smoke and combos, and failed the whole install — while the
@@ -332,7 +376,6 @@ _base_start_comfy(){ # every server this machine runs (3.20.0: one per GPU), sta
   # of silence. So the wait is patient while the process lives and gives up the moment it does not,
   # and it says which of the two happened.
   # 3.20.0: server 0's answer is the result; with N servers its own pid says whether it lives (any main.py would)
-  if [ "$_BASE_SERVER_N" -gt 1 ]; then _BASE_WAIT_PID="$(cat "$st/comfyui.pid" 2>/dev/null || true)"; fi
   _base_wait_comfy; rc=$?
   i=1
   while [ "$i" -lt "$_BASE_SERVER_N" ]; do      # started together, so by now these are up or nearly; one that fails is named
@@ -363,13 +406,13 @@ _base_spawn_server(){ # <i> → server i started in the background with the laun
      if [ "$_BASE_SERVER_N" -gt 1 ]; then echo $! > "$pidf" 2>/dev/null || true; fi; })      # one server needs no pid file
 }
 _base_wait_server(){ # <i> → 0 when server i>0 answers on its port; patient while its own process lives (3.20.0)
-  local i="$1" pid port waited=0 limit="${BASE_START_WAIT:-600}" tries="${BASE_START_TRIES:-}"
+  local i="$1" pid port waited=0 half=0 limit="${BASE_START_WAIT:-600}" tries="${BASE_START_TRIES:-}"
   [ -n "$tries" ] && limit=$((tries * 2))
   port="$(_base_server_port "$i")"; pid="$(cat "$(_base_server_state)/comfyui-gpu$i.pid" 2>/dev/null || true)"
   while [ "$waited" -lt "$limit" ]; do
     if curl -sf --max-time 5 "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1; then echo "  server $i up on 127.0.0.1:$port"; return 0; fi
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then echo "  server $i: its process is gone after $waited s"; return 1; fi
-    sleep 2; waited=$((waited + 2))
+    sleep 0.5; half=$((half + 1)); waited=$((half / 2))
   done
   return 1
 }
@@ -377,11 +420,14 @@ _base_wait_comfy(){ # [grace s] → 0 when HOSTPORT answers; patient while a Com
   # grace (3.0.3): how long no process at all still means "not started yet" rather than "died". A start through the boot
   # unit runs sshd, JupyterLab and the extensions first, so ComfyUI appears seconds after the unit does, not at once.
   # 3.20.0 _BASE_WAIT_PID: server 0's own pid, when N servers run; then only that process counts as alive
-  local grace="${1:-0}" seen=0 tries="${BASE_START_TRIES:-}" waited=0 limit="${BASE_START_WAIT:-600}" alive
+  local grace="${1:-0}" seen=0 tries="${BASE_START_TRIES:-}" waited=0 limit="${BASE_START_WAIT:-600}" alive half=0
   [ -n "$tries" ] && limit=$((tries * 2))            # older callers (and the suite) size it in 2 s tries
+  # 3.27.0: asked every half second (every second since 3.26.0, every 2 s before); the process
+  # check and the progress lines keep their 2 s rhythm, and `waited` stays whole seconds
   while [ "$waited" -lt "$limit" ]; do
-    sleep 2; waited=$((waited + 2))
-    if curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then echo "  up after $waited s"; return 0; fi
+    sleep 0.5; half=$((half + 1)); waited=$((half / 2))
+    if curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then echo "  up after $waited$([ $((half % 2)) = 1 ] && echo .5) s"; return 0; fi
+    [ $((half % 4)) -eq 0 ] || continue
     if [ -n "${_BASE_WAIT_PID:-}" ]; then alive="$(kill -0 "$_BASE_WAIT_PID" 2>/dev/null && echo 1 || true)"
     else alive="$(_base_comfy_pids 2>/dev/null || true)"; fi
     if [ -n "$alive" ]; then seen=1

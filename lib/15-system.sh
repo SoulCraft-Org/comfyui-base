@@ -36,8 +36,12 @@ _base_root(){ # <VAR=val ...> <cmd ...>: as root; `env` carries the variables th
   if [ -n "${BASE_FAKE_APT:-}" ] || [ "$(id -u)" = "0" ]; then env "$@"; else sudo -n env "$@"; fi
 }
 _base_apt(){ # apt-get, never interactive, never restarting a service behind our back, waiting for another apt's lock
+  # 3.26.0: on RunPod dpkg skips its fsync per unpacked file (--force-unsafe-io). What that guards against is a crash in
+  # the middle of an unpack leaving the OS broken on disk; a RunPod container's disk is the image's again at every start,
+  # so nothing of the sort outlives the crash. A VM keeps its disk, and its dpkg keeps every fsync.
+  local io=(); if [ "${BASE_HOST:-}" = runpod ]; then io=(-o Dpkg::Options::=--force-unsafe-io); fi
   _base_root DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1 \
-    apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=600 "$@"
+    apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=600 ${io[@]+"${io[@]}"} "$@"
 }
 _base_running_driver(){ # → the driver the running kernel has loaded, "mismatch" when NVML says the libraries moved, "" with none
   command -v nvidia-smi >/dev/null 2>&1 || { echo ""; return 0; }
@@ -85,6 +89,30 @@ _base_machine_record(){ # the store's per-machine record: which driver and CUDA 
   h="$(hostname -s 2>/dev/null || echo machine)"
   cuda="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9.]+' | awk '{print $3}' | head -1)"
   { echo "host=$h"; echo "driver=${BASE_DRIVER_AFTER:-$(_base_running_driver)}"; echo "cuda=${cuda:-}"; echo "kernel=$(uname -r 2>/dev/null)"; echo "ts=$(_base_ts)"; } > "$d/$h.env" 2>/dev/null || true
+}
+
+_base_apt_core(){ # the base's own apt packages on every host (3.30.2: one list, read by the OS stage and by runtime-capture, which
+  # writes the ones installed on its machine into runtime.json for a machine that skips the OS stage)
+  echo "python3-venv ffmpeg libegl1 libgles2"
+}
+_base_apt_missing(){ # <pkg>... → the ones dpkg does not report installed, one per line
+  local p; for p in "$@"; do dpkg-query -W -f '${db:Status-Abbrev}' "$p" 2>/dev/null | grep -q '^ii' || echo "$p"; done
+}
+_base_apt_ensure(){ # <pkg>... → installs only the missing ones. 0 none missing or all installed (they are printed as "installed: ..."),
+  # 1 the install failed, 2 this machine cannot install (no apt, no root), 3 a fake run (no BASE_FAKE_APT): nothing is touched.
+  local miss=() p log
+  while IFS= read -r p; do [ -n "$p" ] && miss+=("$p"); done < <(_base_apt_missing "$@")
+  [ "${#miss[@]}" -gt 0 ] || return 0
+  if [ -n "$BASE_FAKE_ROOT" ] && [ -z "${BASE_FAKE_APT:-}" ]; then return 3; fi
+  command -v apt-get >/dev/null 2>&1 && _base_can_root || return 2
+  log="$(mktemp)"
+  # an image keeps no package lists: refresh them first, else try the install and refresh only when it fails
+  if ! ls "$(_base_sysroot)"/var/lib/apt/lists/*Packages* >/dev/null 2>&1; then _base_apt update >>"$log" 2>&1 || true; fi
+  if ! _base_apt install "${miss[@]}" >>"$log" 2>&1; then
+    _base_apt update >>"$log" 2>&1 || true
+    if ! _base_apt install "${miss[@]}" >>"$log" 2>&1; then tail -3 "$log"; rm -f "$log"; return 1; fi
+  fi
+  rm -f "$log"; echo "installed: ${miss[*]}"
 }
 
 base_system(){ # the stage; sets BASE_REBOOT_REQUIRED and returns 10 when a restart must come before anything uses the GPU
@@ -147,7 +175,9 @@ base_system(){ # the stage; sets BASE_REBOOT_REQUIRED and returns 10 when a rest
     miss "full-upgrade failed: $(printf '%s\n' "$out" | grep -E '^E:' | head -2 | tr '\n' ' ')"; BASE_FAILED+=("system: apt-get full-upgrade failed"); rc=1
   fi
   # the base's own packages: present, and newest (full-upgrade moved what was installed; this adds what was not)
-  local want=(python3-venv ffmpeg) p missing=()
+  # 3.29.1: libegl1 + libgles2 (Ubuntu 24.04 main) are libEGL.so.1 and libGLESv2.so.2, which MediaPipe's libmediapipe.so
+  # links even on CPU; a pod without them leaves a package's MediaPipe face scores blank (OSError: libEGL.so.1).
+  local want=() p missing=(); read -r -a want <<< "$(_base_apt_core)"
   [ "$host" = verda ] || [ "${BASE_VOLUME_SHARED:-0}" = "1" ] && want+=(nfs-common)
   command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ] || want+=(openssh-server)
   for p in "${want[@]}"; do dpkg-query -W -f '${db:Status-Abbrev}' "$p" 2>/dev/null | grep -q '^ii' || missing+=("$p"); done
