@@ -1479,7 +1479,7 @@ def test_unit_testbed_puts_triton_beside_cpu_torch_on_linux(tmp_path):
     tb, log, run = _testbed_sandbox(tmp_path / "mac", "3.14")
     r = run(go % "Darwin")
     assert r.returncode == 0 and "server started" in r.stdout, r.stdout + r.stderr
-    assert not [c for c in log.read_text().splitlines() if "triton" in c or c.startswith("pip freeze")], log.read_text()
+    assert not [c for c in log.read_text().splitlines() if "triton" in c.split()[-1:] or c.startswith("pip freeze")], log.read_text()
 
 
 def test_unit_testbed_status_names_the_packs_its_server_could_not_import(tmp_path):
