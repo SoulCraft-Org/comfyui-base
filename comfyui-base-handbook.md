@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.30.5.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.30.6.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -964,6 +964,8 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.30.6: the handbook names no package that is not sold (2026-11-23, Paul: SoulCraft sells only Bria FIBO 2.0 and
+  Lightricks LTX products). Version-history notes say "an image package" or "a video package" instead; no code changed.
 - 3.30.5: the testbed's Python is the newest minor on which the most of ComfyUI's and the packs' requirement files
   install from wheels, not only the newest torch ships for (2026-11-22, issue #71). Torch had cp315 wheels while
   onnxruntime and kornia-rs had none, so on 3.15 Easy-Use's, RMBG's and controlnet_aux's nodes never registered. A
@@ -1145,7 +1147,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   end, as before. The early server listens on 127.0.0.1 (ComfyUI always does since 3.14.0), and the app ports that front
   it start at boot install, after base_models and base_prune, so no prompt can reach it while a snapshot
   folder fills or prune moves a file. The server is asked whether it is up every 0.5 s (every second since 3.26.0). `BASE_EARLY_LAUNCH=0` keeps the old order.
-  A package that registers model folders from `pkg_post_models` (video-replacer-minimax-h3 5.9.0 did; 5.9.1 moved them) gets the second
+  A package that registers model folders from `pkg_post_models` (a video package's 5.9.0 did; its 5.9.1 moved them) gets the second
   start until it moves those lines to `pkg_hygiene`. Expected: up to 16 s less pod to App ready, capped by the join's
   length. Exercised by the unit tier's stand-ins only (no pod).
 - 3.26.0: the Python side of a fresh install (Paul's priority 3, install speed, 2026-10-25). Read from the last Video
@@ -1270,10 +1272,10 @@ for any invocation that somehow arrives without the environment. The suite asser
   expect. The rounding cases now run with `_base_cpus_online` stubbed to 64, and the cap is proved with the host's own
   count and a stubbed 2-CPU host. The launch tests drop every key of `BASE_LAUNCH_ENV_KEYS` (read from the base) and
   `CT2_*` from their environment. Only the suite changed; the base's code is as in 3.20.2.
-- 3.20.2: the testbed links the newest copy of a pack two packages vendor (2026-10-17). FLUX 3 Klein and the Video
-  Replacer both vendor ComfyUI-Content-Gate (one folder name, one set of node classes), and `testbed.sh` linked each
-  package's copy into `custom_nodes` by folder name, so whichever package was walked last won (the Replacer's 1.5.0 in
-  workspace integration run 39045535460, failing Klein's comfyui and server tiers). It now keeps the newest version,
+- 3.20.2: the testbed links the newest copy of a pack two packages vendor (2026-10-17). An image package and a video
+  package both vendor ComfyUI-Content-Gate (one folder name, one set of node classes), and `testbed.sh` linked each
+  package's copy into `custom_nodes` by folder name, so whichever package was walked last won (the video package's 1.5.0 in
+  workspace integration run 39045535460, failing the image package's comfyui and server tiers). It now keeps the newest version,
   the rule a pod already follows (`lib/62-own-packs.sh`): `py/own_packs.py newest` picks one folder per pack name, a
   copy with no version loses to one with a version, the same version keeps the first and names two different contents
   under it. `--status` lists each vendored pack's version and the package it comes from.
@@ -1386,7 +1388,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   pure tiers (`<name>-script.sh test quick`: every tier the suite declares except `BASE_HEAVY_TIERS`, those that need a
   live machine), the package's `*.api.json` prompts against its cached `/object_info` (`_build/objinfo.py check`: classes,
   required inputs, links and their types, ranges, combo options, from the output nodes back, as ComfyUI's validator reads
-  the schema; `objinfo.py save` takes the cache from the pod through `podctl tunnel`, in the shape image-creator-krea-2
+  the schema; `objinfo.py save` takes the cache from the pod through `podctl tunnel`, in the shape an image package
   already commits), and the brand's zip guard when its `brand.toml` names one (`zip_guard`). **Tier 1** is `verify.sh`,
   once per release on a free runner; `_build/cloud-verify.md` is the brief for a Claude Code cloud session (what its
   GitHub proxy allows: no check runs, statuses or deployments). **Tier 2**, `podctl runner <pod>`, opt-in: the machine as
@@ -1412,7 +1414,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   the runner refusing a foreign server.
   Also in 3.16.0: a re-install that takes the "already installed" shortcut (3.11.0) prints the models line every run prints
   (`models ok N in place · moved 0 · downloaded 0 · failed 0`). It printed only "install skipped", and every package's
-  install test, which reads "downloaded 0" from a second run, failed on the free CI runner (image-creator-flux-3-klein#6,
+  install test, which reads "downloaded 0" from a second run, failed on the free CI runner (an image package's issue #6,
   video-creator#6, photo-auditor#6). The second-run test now asserts the line.
 - 3.15.3: a failing suite's report keeps each failing test whole (2026-10-16). `_build/verify.sh` printed only 12 to 24
   lines of a failure, so a long assertion lost its cause in CI (it hid a Video Replacer failure's reason). It now prints
@@ -1422,8 +1424,8 @@ for any invocation that somehow arrives without the environment. The suite asser
   packs' requirements step to skip the set the venv build had just installed; it resolved it again (138 s on the pod)
   because the build took its fingerprint before reading the torch constraints from the venv again, and the install had
   moved setuptools and the like. The build now reads them first, as the packs' step does. Measured before the fix, two
-  fresh pods made side by side (H100 80GB HBM3, EU-FR-1, `runpod/base:1.4.0-cuda1300-ubuntu2404`, a network volume, the
-  MiniMax H3 Video Continuer 1.0.5 and its 41.1 GB, `--no-gate --no-suite`), wall clock from `podctl create` to the
+  fresh pods made side by side (H100 80GB HBM3, EU-FR-1, `runpod/base:1.4.0-cuda1300-ubuntu2404`, a network volume, a
+  video package at 1.0.5 and its 41.1 GB, `--no-gate --no-suite`), wall clock from `podctl create` to the
   workflow listed through the public proxy: 3.9.2 2113 s, 3.11.0 1716 s (397 s less, 19 %). Stage by stage, 3.9.2 then
   3.11.0: venv 743 / 689, newest 467 / 467, downloads 226 / hidden (127 s beside the venv chain; the join waited under
   a second), import check 203 / 144, packs pip 127 / 138 (the defect above), restart 89 / 87, BOOT 83 / 1 (the tools
@@ -1538,8 +1540,8 @@ for any invocation that somehow arrives without the environment. The suite asser
   an early file is counted once (as downloaded), a row the early pass left alone is fetched there, and a file it could
   not get fails the run by name with no second round of attempts. A run that stops before the join stops its
   downloads (they resume from staging). `BASE_MODELS_FOREGROUND=1` keeps the old order. Measured on RunPod, two fresh
-  pods made side by side (H100 80GB HBM3, EU-FR-1, `runpod/base:1.4.0-cuda1300-ubuntu2404`, a network volume, the MiniMax
-  H3 Video Continuer 1.0.5 with its 41.1 GB of models, `--no-gate --no-suite`), wall clock from `podctl create` to the
+  pods made side by side (H100 80GB HBM3, EU-FR-1, `runpod/base:1.4.0-cuda1300-ubuntu2404`, a network volume, a
+  video package at 1.0.5 with its 41.1 GB of models, `--no-gate --no-suite`), wall clock from `podctl create` to the
   workflow listed through the pod's public proxy: 3.9.2 1610 s, 3.11.0 1471 s (139 s less; 167 s less from the pod's
   first ssh to the end of the install, against a 181 s download stage in 3.9.2). The early downloads ran 605 s at 70 MB/s
   beside the venv, packs pip and newest pass (304 MB/s alone in 3.9.2), and the join waited under a second. Where 3.9.2
@@ -1554,7 +1556,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   pod started; at most 15 minutes. (2) After its own reset it kept polling the OLD ssh port: the API answers with the pod as it was for a while
   after the PATCH, and RunPod had moved 22/tcp (20424 to 36944). It now waits for `lastStartedAt` to move and looks for
   sshd on the port the pod has now, re-read on every try. (3) `podctl install` on a package folder not named after its
-  package (`vr` for `video-replacer-minimax-h3`) stopped on "vr has no zip (vr-runpod.zip)"; it now says the folder's
+  package (a short folder name for a video package) stopped on "vr has no zip (vr-runpod.zip)"; it now says the folder's
   name must be the package's and names the one to rename it to. (4) `podctl create` offered data centres a pod cannot be
   created in: the stock view names more than REST v1 `POST /pods` takes (its `dataCenterIds` enum has 30 ids and lacks
   US-NE-1, a B200 location: a schema 400), and it picked ones that take no network volume (US-NC-1, US-MO-2, EUR-IS-2:
