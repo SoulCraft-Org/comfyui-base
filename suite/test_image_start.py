@@ -1,6 +1,6 @@
 """unit tier, 3.26.0: the template image's head start.
 
-The template image (the template image's ghcr comfyui-base) carries a seed built at the volume's own paths under
+The template image (`ghcr.io/soulcraft-org/comfyui-base`) carries a seed built at the volume's own paths under
 /opt/comfy-seed: ComfyUI, a venv, the managed CPython it boots from, and uv's cache with every wheel of that venv
 unpacked. A podctl pod never copies the seed, so before 3.26.0 its venv downloaded and unpacked all 4.1 GB again on the
 image that already held them. A venv built on such a machine now reads those wheels, and the picks, the newest pass and

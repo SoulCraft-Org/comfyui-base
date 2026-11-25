@@ -199,7 +199,7 @@ _base_venv_boot_line(){ # [venv] → the banner's "boots from" line, judged by t
 }
 
 # ---------------------------------------------------------------- 3.26.0: the template image's head start
-# The template image (the template image's ghcr comfyui-base) carries a seed built at the volume's own paths, under
+# The template image (`ghcr.io/soulcraft-org/comfyui-base`) carries a seed built at the volume's own paths, under
 # BASE_IMAGE_SEED (/opt/comfy-seed): ComfyUI, a venv, the managed CPython it boots from, and since 3.26.0 uv's cache with
 # every wheel of that venv unpacked (one copy in the layer: the cache's files are hardlinks of the venv's). A venv built
 # here needs no download for anything the image holds: uv reads the image's cache and links the files (copies them,

@@ -1428,8 +1428,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   the runner refusing a foreign server.
   Also in 3.16.0: a re-install that takes the "already installed" shortcut (3.11.0) prints the models line every run prints
   (`models ok N in place · moved 0 · downloaded 0 · failed 0`). It printed only "install skipped", and every package's
-  install test, which reads "downloaded 0" from a second run, failed on the free CI runner (an image package's issue #6,
-  another package issue, a third package issue). The second-run test now asserts the line.
+  install test, which reads "downloaded 0" from a second run, failed on the free CI runner (issue #6 in three packages). The second-run test now asserts the line.
 - 3.15.3: a failing suite's report keeps each failing test whole (2026-10-16). `_build/verify.sh` printed only 12 to 24
   lines of a failure, so a long assertion lost its cause in CI (it hid a Video Replacer failure's reason). It now prints
   pytest's ERRORS and FAILURES sections (each test's header, its `>` lines and its whole E block), capped at 200 lines,

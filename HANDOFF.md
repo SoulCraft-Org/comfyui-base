@@ -177,7 +177,7 @@ notes (`install-speed-ranked.md`, `install-speed-sources.md`).
 ## Requests
 
 ### 1. To the MiniMax H3 Video Replacer: declare the app's port
-One line in `example-package-script.sh`, beside `WF_NAME`, once the workspace pins base 3.9.0 (`BASE_MIN`
+One line in the app's script, beside `WF_NAME`, once the workspace pins base 3.9.0 (`BASE_MIN`
 may stay: a base before 3.9.0 never reads the array): `APP_PORTS=("8189|video-replacer|Video Replacer App")`. Then `podctl create`, `status`, `tunnel`
 and the template name it, and the machine serves the app at that port's root. The app needs no change: it already
 reaches ComfyUI through `new URL("../../", HERE)` and names no top-level file `ws upload view history queue interrupt`.
