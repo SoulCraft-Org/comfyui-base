@@ -109,7 +109,7 @@ _base_green_run(){ # the whole run when _base_already_green: the workflow checke
   hdr "SUMMARY · ${PKG_NAME:-ComfyUI Base} V${PKG_VERSION:-$BASE_VERSION} · base $BASE_VERSION · already installed"
   echo "  install    skipped: this store already holds it, green ($(cat "$f" 2>/dev/null))"
   # 3.16.0: the models line every run prints, so a reader of the summary (the packages' install tests grep "downloaded 0" on
-  # a second run) finds it here too; a skipped install downloads nothing by definition (free CI, image-creator-flux-3-klein#6)
+  # a second run) finds it here too; a skipped install downloads nothing by definition (free CI, a package issue)
   echo "  models     ok ${BASE_GREEN_FILES:-0} in place · moved 0 · downloaded 0 · failed 0"
   echo "  restart    $BASE_RESTART_RESULT"
   _base_timings_block; _base_timings_write

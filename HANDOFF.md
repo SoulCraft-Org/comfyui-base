@@ -40,7 +40,7 @@ repo and from the extracted zip; the counts are in the release commit's PR, Soul
 - `suite/test_podctl.py::test_unit_repo_root…` fails on any checkout under `~/Developer` on this Mac, because
   `~/Developer/base/comfyui-base` exists (repo_root walks up to it). Environmental, not a code defect; not changed.
 - The workspace's `bootstrap.sh` dies on macOS's bash 3.2 without `--depth` (`DEPTH[@]: unbound variable`, line 41).
-- runpod-template's image test reports `Dockerfile, seed-script.sh` stale against any base newer than its last
+- the template image's image test reports `Dockerfile, seed-script.sh` stale against any base newer than its last
   regeneration; it moves with the `repos.txt` pin, not with this change.
 
 ## 2. Model downloads beside the venv build (3.11.0)   (2026-10-16, two RunPod pods, both deleted)
@@ -177,7 +177,7 @@ notes (`install-speed-ranked.md`, `install-speed-sources.md`).
 ## Requests
 
 ### 1. To the MiniMax H3 Video Replacer: declare the app's port
-One line in `video-replacer-minimax-h3-script.sh`, beside `WF_NAME`, once the workspace pins base 3.9.0 (`BASE_MIN`
+One line in `example-package-script.sh`, beside `WF_NAME`, once the workspace pins base 3.9.0 (`BASE_MIN`
 may stay: a base before 3.9.0 never reads the array): `APP_PORTS=("8189|video-replacer|Video Replacer App")`. Then `podctl create`, `status`, `tunnel`
 and the template name it, and the machine serves the app at that port's root. The app needs no change: it already
 reaches ComfyUI through `new URL("../../", HERE)` and names no top-level file `ws upload view history queue interrupt`.
@@ -224,7 +224,7 @@ copied its seed, and its build deleted uv's cache.
 `UV_LINK_MODE=copy` across filesystems), `_base_image_python`, `_base_image_twin`, `_base_in_image_seed`, and
 `_base_torch_pick` answering once per run. `lib/40-packs.sh`: CONSOLIDATE skips the seed's tree and venv.
 `lib/47-latest.sh`: `_base_outdated --exclude` the torch closure. `lib/15-system.sh`: `--force-unsafe-io` on RunPod.
-`lib/85-launch.sh`: the readiness polls every second. The image's half is runpod-template's PR of the same day (the seed
+`lib/85-launch.sh`: the readiness polls every second. The image's half is the template image's PR of the same day (the seed
 keeps uv's cache, hardlinked with its venv; ffmpeg and the OS upgrade baked in; the seed copy keeps hardlinks).
 
 **Proven, and how.** The unit tier in CI (`suite/test_image_start.py`, and tests beside the pick, the scan, apt and the
