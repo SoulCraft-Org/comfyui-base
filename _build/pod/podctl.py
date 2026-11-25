@@ -1163,7 +1163,7 @@ def install(pod_id, dirs, io, every=5, timeout=3 * 3600, latest=True, save_pins_
     items = items or [item_for(d) for d in dirs]
     for it in items:
         if it["kind"] == "pkg" and not it.get("buyer") and not it["local_script"].exists():
-            # 3.10.1: a folder not named after its package ("vr" for video-replacer-minimax-h3) used to stop on "vr has no
+            # 3.10.1: a folder not named after its package ("vr" for example-package) used to stop on "vr has no
             # zip (vr-runpod.zip)", which sends one to build a zip that cannot exist under that name
             found = sorted(p.name[:-len("-script.sh")] for p in it["dir"].glob("*-script.sh"))
             io.say("STOP: the folder %s is not named after its package: a package folder's name is its package's name, the "
