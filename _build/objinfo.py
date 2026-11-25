@@ -5,7 +5,7 @@
                                                                                   # `podctl tunnel` (127.0.0.1:8188), else the testbed
     python3 "$COMFY_BASE/_build/objinfo.py" check <pkg dir>...                      # offline, in seconds (tier 0: _build/quick.sh)
 
-The cache is <pkg>/_build/object_info.json, the shape image-creator-krea-2's _build/object_info.py has committed since
+The cache is <pkg>/_build/object_info.json, the shape a package's _build/object_info.py has committed since
 2026-09: {comfyui, frontend, server, generated, missing, frontend_only, venv_gated, types: {class: /object_info[class]}},
 for every class the package's workflow (subgraph interiors included) and its API prompts use. Key order is ComfyUI's own,
 never sorted: the frontend restores widgets_values positionally into it. _build/ is not in any zip, so the cache never

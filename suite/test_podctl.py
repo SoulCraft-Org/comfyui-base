@@ -2656,12 +2656,12 @@ def test_unit_install_says_a_package_folder_must_be_named_after_its_package(tmp_
     a zip that cannot exist under that name. The STOP now says what is wrong and the name the folder must have."""
     import types
     podctl = _load()
-    d = tmp_path / "vr"; d.mkdir(); (d / "video-replacer-minimax-h3-script.sh").write_text("PKG_NAME=x\n")
+    d = tmp_path / "vr"; d.mkdir(); (d / "example-package-script.sh").write_text("PKG_NAME=x\n")
     said = []
     assert podctl.install("pod1", [d], types.SimpleNamespace(say=said.append), every=1, timeout=5) == 1
     assert said == ["STOP: the folder vr is not named after its package: a package folder's name is its package's name, the stem "
-                    "of <name>-script.sh and of its zip, and vr has no vr-script.sh (it holds video-replacer-minimax-h3-script.sh: "
-                    "rename the folder to video-replacer-minimax-h3)"], said
+                    "of <name>-script.sh and of its zip, and vr has no vr-script.sh (it holds example-package-script.sh: "
+                    "rename the folder to example-package)"], said
     e = tmp_path / "empty"; e.mkdir(); said.clear()
     assert podctl.install("pod1", [e], types.SimpleNamespace(say=said.append)) == 1 and said[0].endswith("empty has no empty-script.sh"), said
 

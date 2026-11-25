@@ -693,8 +693,8 @@ Mac gate. podctl polls every 5 s, and since 3.24.0 the wait is on the machine (S
 so the end of a step is seen within a second. Every ssh, scp and log fetch of one run shares ONE connection (3.24.0,
 ControlMaster; `PODCTL_SSH_MUX=0` turns it off).
 
-**The image's head start** (3.26.0). On the template image (`runpod-template`, `ghcr.io/soulcraft-org/comfyui-base`),
-`BASE_IMAGE_SEED` (`/opt/comfy-seed`) holds a seed built at the volume's own paths, and from runpod-template#21 on, uv's
+**The image's head start** (3.26.0). On the template image (the template image repository, `ghcr.io/soulcraft-org/comfyui-base`),
+`BASE_IMAGE_SEED` (`/opt/comfy-seed`) holds a seed built at the volume's own paths, and from template image change 21 on, uv's
 cache with every wheel of the seed's venv (one copy in the layer: the cache's files are hardlinks of the venv's). A podctl
 pod never copies the seed (its boot guard runs only a `boot.sh` already on the volume), so its venv used to fetch the
 4.1 GB the image already held. A venv the run must build now reads the seed's cache, the twin of the volume's
@@ -1175,7 +1175,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   from the build day) are dropped first, since an index sending a long max-age would have uv trust them and resolve
   older (the unit tier shows exactly that against a local index, then the empty freeze diff with the guard); the
   image's CPython is copied onto a volume that has none of that minor; CONSOLIDATE no
-  longer reports or sizes the seed's tree and venv. The image carries the cache from runpod-template's own change of
+  longer reports or sizes the seed's tree and venv. The image carries the cache from the template image's own change of
   the same day. (2) The torch pick is answered once per run for each minor and venv backend (`_base_torch_pick`): a fresh
   venv asked twice, four or five compiles each time; a failed pick is asked again. (3) The newest pass's outdated scan
   leaves the torch closure out of the query (`--exclude`), not only out of its answer. (4) On RunPod, dpkg runs with
@@ -1246,7 +1246,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   (`tunnel_local_ports`). That also fixes an older split: `podctl tunnel`'s default ports were bound as 8188 and 8888
   whatever the offset said, while ssh-config, jupyter and mcp printed the offset ports; a plain port is now sent as
   LOCAL:REMOTE whenever the two differ. 11434 (Ollama's) is no longer forwarded. 2.9.1 kept it in case a package ran an
-  inference server on the machine. No package of the repositories around the base does (photo-auditor dropped its
+  inference server on the machine. No package of the repositories around the base does (one package dropped its
   Ollama tier in 2.0.0, 2026-10-17), and a workstation that keeps 11434 empty cannot run a session that binds it. The
   machine still reserves the port for APP_PORTS, and `--port 11434` forwards it. `SSH_BLOCK` is built from
   `TUNNEL_SERVICES` now, so the two cannot drift apart. The unit tier covers the block and its refusals, the tunnel
@@ -1428,8 +1428,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   the runner refusing a foreign server.
   Also in 3.16.0: a re-install that takes the "already installed" shortcut (3.11.0) prints the models line every run prints
   (`models ok N in place · moved 0 · downloaded 0 · failed 0`). It printed only "install skipped", and every package's
-  install test, which reads "downloaded 0" from a second run, failed on the free CI runner (an image package's issue #6,
-  video-creator#6, photo-auditor#6). The second-run test now asserts the line.
+  install test, which reads "downloaded 0" from a second run, failed on the free CI runner (issue #6 in three packages). The second-run test now asserts the line.
 - 3.15.3: a failing suite's report keeps each failing test whole (2026-10-16). `_build/verify.sh` printed only 12 to 24
   lines of a failure, so a long assertion lost its cause in CI (it hid a Video Replacer failure's reason). It now prints
   pytest's ERRORS and FAILURES sections (each test's header, its `>` lines and its whole E block), capped at 200 lines,
@@ -1446,7 +1445,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   venv's 112 s hidden), packs git 39 / 57 (uv's once-per-run refresh moved before the venv). The existing-volume case is
   not measured: the Continuer's smoke fails on every base (`LoadImageCrop` not registered), so it never leaves the green
   verdict the skip needs.
-- 3.15.1: the copy reads from a local twin where it has one (2026-10-16, runpod-template-prebuilt's review). On a
+- 3.15.1: the copy reads from a local twin where it has one (2026-10-16, the template image prebuilt's review). On a
   template pod's first boot every file crossed the network volume twice: the image's seed (`/opt/comfy-seed`) rsynced
   onto the volume, then read back from it for the container-disk copy. `BASE_RUN_TWIN=/opt/comfy-seed=/workspace`
   (the template sets it; the pod's env, or PID 1's for an install over ssh; comma-separated pairs) makes `run_local.py`
@@ -1595,7 +1594,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   zero-argument startup call into a one-argument one (the startup default graph then does not load). Matched only with
   Manager's frame on top; the one-line fixes belong upstream in either pack. And a seed build gets past its import
   check: with `BASE_SEED=1` (the template image, built where no GPU is) `main.py --quick-test-for-ci` died "Found no
-  NVIDIA driver" before importing a pack, the next wall after 3.9.1's venv verify (runpod-template's image job,
+  NVIDIA driver" before importing a pack, the next wall after 3.9.1's venv verify (the template image's image job,
   2026-10-16). Both the full and the scoped check now pass `--cpu` for a seed build alone (`_base_quick_cpu`): every
   pack is still imported and judged, and a real machine's check still starts on its GPU. Unit tests on fakes (cgroup
   root, stub python, the bash 3.2 boot path, the import check's arguments) and the classifier test.

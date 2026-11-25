@@ -480,7 +480,7 @@ def test_unit_verify_asks_for_a_gpu_except_in_a_seed_build(tmp_path):
 
 def test_unit_import_check_runs_on_cpu_in_a_seed_build_only(tmp_path):
     """3.10.0: the seed build's import check ran `main.py --quick-test-for-ci` where no GPU is and ComfyUI died "Found no
-    NVIDIA driver" before importing a pack (runpod-template image job, 2026-10-16). Both the full and the scoped check
+    NVIDIA driver" before importing a pack (template image job, 2026-10-16). Both the full and the scoped check
     pass --cpu for BASE_SEED=1 alone; a real machine's check still starts on its GPU."""
     comfy = tmp_path / "comfy"; comfy.mkdir()
     py = tmp_path / "py"; py.write_text('#!/bin/sh\necho "ARGS $*"\n'); py.chmod(0o755)
@@ -1448,7 +1448,7 @@ def test_unit_testbed_replaces_a_half_made_venv(tmp_path):
 
 
 def test_unit_testbed_puts_triton_beside_cpu_torch_on_linux(tmp_path):
-    """3.22.1 (image-creator-krea-2#10): CPU torch has no triton, and packs import it at module level (ComfyUI-RMBG's HEAD
+    """3.22.1 (a package issue): CPU torch has no triton, and packs import it at module level (ComfyUI-RMBG's HEAD
     through its bundled sam3, ComfyUI-Easy-Sam3), so neither registered on the Linux testbed while a pod's CUDA torch
     carries it. On Linux --server installs the newest triton right after torch, against a constraints file of the torch
     family as installed so it never moves torch; a triton that will not install is a warning and the build goes on;
@@ -1483,7 +1483,7 @@ def test_unit_testbed_puts_triton_beside_cpu_torch_on_linux(tmp_path):
 
 
 def test_unit_testbed_status_names_the_packs_its_server_could_not_import(tmp_path):
-    """3.22.1: image-creator-krea-2's CI (run 39078526395) passed its suite while ComfyUI-RMBG never registered on the
+    """3.22.1: a package's CI (run 39078526395) passed its suite while ComfyUI-RMBG never registered on the
     testbed, and nothing in the log said so. --status reads ComfyUI's own import times from this server's log and names
     every pack marked (IMPORT FAILED), or "none"; a server this testbed did not start is never read."""
     _repo_only("the repo's testbed.sh")
@@ -4127,7 +4127,7 @@ def test_unit_the_boot_stops_a_comfyui_it_does_not_own_before_starting_its_own()
 def test_build_tools_default_to_their_own_testbed_port():
     """3.27.1: a tool's --server default is BASE_SERVER, else 127.0.0.1:$TESTBED_PORT, else 8199. A runner Space runs two
     runners (workspace ci/hf-runner/), each with its own TESTBED_PORT (8199, 8299); a bare 8199 default reached the other
-    runner's testbed in the middle of its gate (photo-auditor's engine job, 2026-10-25)."""
+    runner's testbed in the middle of its gate (a package's engine job, 2026-10-25)."""
     import re
     root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_build")
     bare = []
