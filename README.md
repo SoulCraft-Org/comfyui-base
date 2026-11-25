@@ -44,7 +44,7 @@ cd <volume>/packages && mkdir -p "<name>" && python3 -m zipfile -e "<name>-<host
 ```
 
 From a Mac, with the driver, the same two steps are `podctl ensure <machine>` then `podctl install <machine> --base --pkg <dir>`.
-The handbook (`comfyui-base-handbook.md`) has the design rules, the per-host recipes and the package contract.
+The [handbook](comfyui-base-handbook.md) is this repository's spec: it has the design rules, the per-host recipes and the package contract.
 
 ## Using it from your own repository
 
